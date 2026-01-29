@@ -1,34 +1,65 @@
 import torch
 from torch.utils.data import DataLoader
 import pathlib
-from vfi_utils import load_file_from_github_release, preprocess_frames, postprocess_frames, generic_frame_loop, InterpolationStateList
+from vfi_utils import load_file_from_github_release, preprocess_frames, postprocess_frames, InterpolationStateList
 import typing
-from comfy.model_management import get_torch_device
+from comfy.model_management import get_torch_device, soft_empty_cache
+import comfy.utils
 import re
 from functools import cmp_to_key
 from packaging import version
+import gc
+import sys
+
+class VFIProgressBar:
+    """A progress bar that displays both in ComfyUI UI and terminal"""
+    def __init__(self, total, desc="RIFE VFI"):
+        self.total = total
+        self.n = 0
+        self.desc = desc
+        self.comfy_pbar = comfy.utils.ProgressBar(total)
+        self._print_terminal()
+    
+    def update(self, n=1):
+        self.n += n
+        self.comfy_pbar.update(n)
+        self._print_terminal()
+    
+    def _print_terminal(self):
+        if self.total > 0:
+            percent = 100 * (self.n / float(self.total))
+            bar_length = 40
+            filled_length = int(bar_length * self.n // self.total)
+            bar = '█' * filled_length + '-' * (bar_length - filled_length)
+            sys.stdout.write(f'\r{self.desc}: [{bar}] {percent:.1f}%')
+            sys.stdout.flush()
+            if self.n >= self.total:
+                sys.stdout.write('\n')
+                sys.stdout.flush()
 
 MODEL_TYPE = pathlib.Path(__file__).parent.name
+
 CKPT_NAME_VER_DICT = {
     "rife40.pth": "4.0",
-    "rife41.pth": "4.0", 
-    "rife42.pth": "4.2", 
-    "rife43.pth": "4.3", 
-    "rife44.pth": "4.3", 
+    "rife41.pth": "4.0",
+    "rife42.pth": "4.2",
+    "rife43.pth": "4.3",
+    "rife44.pth": "4.3",
     "rife45.pth": "4.5",
     "rife46.pth": "4.6",
     "rife47.pth": "4.7",
     "rife48.pth": "4.7",
     "rife49.pth": "4.7",
     "sudo_rife4_269.662_testV1_scale1.pth": "4.0"
-    #Arch 4.10 doesn't work due to state dict mismatch
-    #TODO: Investigating and fix it
-    #"rife410.pth": "4.10",
-    #"rife411.pth": "4.10",
-    #"rife412.pth": "4.10"
+    # Arch 4.10 doesn't work due to state dict mismatch
+    # "rife410.pth": "4.10",
+    # "rife411.pth": "4.10",
+    # "rife412.pth": "4.10"
 }
 
+
 class RIFE_VFI:
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -40,26 +71,25 @@ class RIFE_VFI:
                 "frames": ("IMAGE", ),
                 "clear_cache_after_n_frames": ("INT", {"default": 10, "min": 1, "max": 1000}),
                 "multiplier": ("INT", {"default": 2, "min": 1}),
-                "fast_mode": ("BOOLEAN", {"default":True}),
-                "ensemble": ("BOOLEAN", {"default":True}),
+                "ensemble": ("BOOLEAN", {"default": True}),
                 "scale_factor": ([0.25, 0.5, 1.0, 2.0, 4.0], {"default": 1.0})
             },
             "optional": {
                 "optional_interpolation_states": ("INTERPOLATION_STATES", )
             }
         }
-    
+
+    # ComfyUI uses RETURN_TYPES and FUNCTION to determine how to wire nodes
     RETURN_TYPES = ("IMAGE", )
     FUNCTION = "vfi"
     CATEGORY = "ComfyUI-Frame-Interpolation/VFI"
-    
+
     def vfi(
         self,
         ckpt_name: typing.AnyStr,
         frames: torch.Tensor,
         clear_cache_after_n_frames = 10,
         multiplier: typing.SupportsInt = 2,
-        fast_mode = False,
         ensemble = False,
         scale_factor = 1.0,
         optional_interpolation_states: InterpolationStateList = None,
@@ -76,32 +106,140 @@ class RIFE_VFI:
                 How high you should set it depends on how many input frames there are, input resolution (after upscaling),
                 how many times you want to multiply them, and how long you're willing to wait for the process to complete.
             multiplier (int, optional): The multiplier for each input frame. 60 input frames * 2 = 120 output frames. Defaults to 2.
+            ensemble (bool, optional): Whether to use ensemble mode for better quality. Defaults to True.
+            scale_factor (float, optional): Scale factor for multi-scale processing. Defaults to 1.0.
     
         Returns:
             tuple: A tuple containing the output interpolated frames.
     
         Note:
-            This method interpolates frames in a video sequence using a specified checkpoint model. 
+            This method interpolates frames in a video sequence using a specified checkpoint model.
             It processes each frame sequentially, generating interpolated frames between them.
     
             To prevent memory overflow, it clears the CUDA cache after processing a specified number of frames.
         """
+        
+        print(f"[DEBUG RIFE] Starting VFI with ckpt_name={ckpt_name}, multiplier={multiplier}, ensemble={ensemble}")
+        
+        # Local import of the model definition to avoid circular imports
         from .rife_arch import IFNet
+
+        # Resolve the checkpoint path and instantiate the model
         model_path = load_file_from_github_release(MODEL_TYPE, ckpt_name)
         arch_ver = CKPT_NAME_VER_DICT[ckpt_name]
         interpolation_model = IFNet(arch_ver=arch_ver)
         interpolation_model.load_state_dict(torch.load(model_path))
-        interpolation_model.eval().to(get_torch_device())
+
+        # Move model to correct device and set to eval mode
+        device = get_torch_device()
+        print(f"[DEBUG RIFE] Using device: {device}")
+        interpolation_model.eval().to(device)
+
+        # Convert input frames from NHWC to NCHW and ensure float32 dtype
         frames = preprocess_frames(frames)
-        
-        def return_middle_frame(frame_0, frame_1, timestep, model, scale_list, in_fast_mode, in_ensemble):
-            return model(frame_0, frame_1, timestep, scale_list, in_fast_mode, in_ensemble)
-        
-        scale_list = [8 / scale_factor, 4 / scale_factor, 2 / scale_factor, 1 / scale_factor] 
-        
-        args = [interpolation_model, scale_list, fast_mode, ensemble]
-        out = postprocess_frames(
-            generic_frame_loop(type(self).__name__, frames, clear_cache_after_n_frames, multiplier, return_middle_frame, *args, 
-                               interpolation_states=optional_interpolation_states, dtype=torch.float32)
-        )
-        return (out,)
+        print(f"[DEBUG RIFE] Input frames shape after preprocess: {frames.shape}")
+        dtype = torch.float32
+
+        # Prepare per-frame multipliers (one per frame pair)
+        num_pairs = len(frames) - 1
+        if isinstance(multiplier, int):
+            multipliers = [int(multiplier)] * num_pairs
+        else:
+            multipliers = list(map(int, multiplier))
+            multipliers += [2] * (num_pairs - len(multipliers))
+
+        # Determine the scale list used by RIFE for multi-scale processing
+        scale_list = [8 / scale_factor, 4 / scale_factor, 2 / scale_factor, 1 / scale_factor]
+        print(f"[DEBUG RIFE] Scale list: {scale_list}")
+        print(f"[DEBUG RIFE] Number of frame pairs to process: {num_pairs}")
+        print(f"[DEBUG RIFE] Multipliers per pair: {multipliers[:5]}... (showing first 5)")
+
+        output_frames: typing.List[torch.Tensor] = []
+        frames_processed_since_cache_clear = 0
+
+        # Build a list of interpolation tasks across all frame pairs. Each task is a
+        # tuple of (pair_idx, dt) representing the pair index and timestep fraction.
+        # Pairs that are skipped via optional_interpolation_states have no tasks.
+        tasks: typing.List[typing.Tuple[int, float]] = []
+        num_tasks_per_pair: typing.Dict[int, int] = {}
+        for pair_idx in range(len(frames) - 1):
+            if optional_interpolation_states is not None and optional_interpolation_states.is_frame_skipped(pair_idx):
+                num_tasks_per_pair[pair_idx] = 0
+                continue
+            m = multipliers[pair_idx]
+            n = max(m - 1, 0)
+            num_tasks_per_pair[pair_idx] = n
+            for step in range(1, m):
+                tasks.append((pair_idx, step / m))
+
+        # Dictionary mapping pair index to list of intermediate frames
+        results: typing.Dict[int, typing.List[torch.Tensor]] = {i: [] for i in range(len(frames) - 1)}
+
+        # Initialize progress bar (both UI and terminal)
+        print(f"[DEBUG RIFE] Total interpolation tasks: {len(tasks)}")
+        pbar = VFIProgressBar(len(tasks), desc="RIFE VFI")
+
+        pos = 0
+        print(f"[DEBUG RIFE] Starting interpolation loop...")
+        while pos < len(tasks):
+            # Always process a single task at a time since batching is disabled.
+            batch_tasks = tasks[pos : pos + 1]
+            # prepare lists
+            frame0_list: typing.List[torch.Tensor] = []
+            frame1_list: typing.List[torch.Tensor] = []
+            timestep_list: typing.List[float] = []
+            for (pair_idx, dt) in batch_tasks:
+                frame0_cpu = frames[pair_idx:pair_idx+1]
+                frame1_cpu = frames[pair_idx+1:pair_idx+2]
+                frame0_list.append(frame0_cpu)
+                frame1_list.append(frame1_cpu)
+                timestep_list.append(dt)
+            # combine and move to device
+            frame0_batch = torch.cat(frame0_list, dim=0).to(device).to(dtype)
+            frame1_batch = torch.cat(frame1_list, dim=0).to(device).to(dtype)
+            timestep_tensor = torch.tensor(timestep_list, dtype=dtype, device=device).view(-1, 1, 1, 1)
+
+            with torch.no_grad():
+                middle_frames = interpolation_model(
+                    frame0_batch,
+                    frame1_batch,
+                    timestep_tensor,
+                    scale_list,
+                    training=False,
+                    ensemble=ensemble
+                ).clamp(0, 1)
+
+            middle_frames_cpu = middle_frames.detach().cpu().to(dtype)
+
+            # assign outputs
+            for idx, (pair_idx, _dt) in enumerate(batch_tasks):
+                results[pair_idx].append(middle_frames_cpu[idx:idx+1])
+                num_tasks_per_pair[pair_idx] -= 1
+                if num_tasks_per_pair[pair_idx] == 0:
+                    frames_processed_since_cache_clear += 1
+                    if frames_processed_since_cache_clear >= clear_cache_after_n_frames:
+                        soft_empty_cache()
+                        frames_processed_since_cache_clear = 0
+                        gc.collect()
+            # Update progress bar (both UI and terminal)
+            pbar.update(len(batch_tasks))
+            pos += len(batch_tasks)
+
+        # Assemble the final output: original frames with their interpolated frames
+        for frame_idx in range(len(frames) - 1):
+            frame0_cpu = frames[frame_idx:frame_idx+1]
+            output_frames.append(frame0_cpu.to(dtype=dtype))
+            # append intermediate frames if pair not skipped
+            if optional_interpolation_states is None or not optional_interpolation_states.is_frame_skipped(frame_idx):
+                for mid in results[frame_idx]:
+                    output_frames.append(mid)
+        # append last frame
+        output_frames.append(frames[-1:].to(dtype=dtype))
+
+        soft_empty_cache()
+
+        out_tensor = torch.cat(output_frames, dim=0)
+        print(f"[DEBUG RIFE] Final output tensor shape: {out_tensor.shape}")
+        out_images = postprocess_frames(out_tensor)
+        print(f"[DEBUG RIFE] Final output images shape: {out_images.shape}")
+        return (out_images,)

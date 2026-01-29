@@ -117,20 +117,6 @@ def conv_woact(in_planes, out_planes, kernel_size=3, stride=1, padding=1, dilati
             padding=padding,
             dilation=dilation,
             bias=True,
-        ),
-    )
-
-
-def conv_woact(in_planes, out_planes, kernel_size=3, stride=1, padding=1, dilation=1):
-    return nn.Sequential(
-        nn.Conv2d(
-            in_planes,
-            out_planes,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            bias=True,
         )
     )
 
@@ -374,10 +360,12 @@ class IFNet(nn.Module):
         timestep=0.5,
         scale_list=[8, 4, 2, 1],
         training=True,
-        fastmode=True,
         ensemble=False,
         return_flow=False,
     ):
+        print(f"[DEBUG RIFE IFNet] Forward called with arch_ver={self.arch_ver}, ensemble={ensemble}")
+        print(f"[DEBUG RIFE IFNet] Input shapes: img0={img0.shape}, img1={img1.shape}")
+        
         img0 = torch.clamp(img0, 0, 1)
         img1 = torch.clamp(img1, 0, 1)
 
@@ -577,10 +565,6 @@ class IFNet(nn.Module):
             mask = torch.sigmoid(mask)
             merged[3] = warped_img0 * mask + warped_img1 * (1 - mask)
 
-        if not fastmode and self.arch_ver in ["4.0", "4.2", "4.3"]:
-            c0 = self.contextnet(img0, flow[:, :2])
-            c1 = self.contextnet(img1, flow[:, 2:4])
-            tmp = self.unet(img0, img1, warped_img0, warped_img1, mask, flow, c0, c1)
-            res = tmp[:, :3] * 2 - 1
-            merged[3] = torch.clamp(merged[3] + res, 0, 1)
-        return merged[3][:, :, :h, :w]
+        output = merged[3][:, :, :h, :w]
+        print(f"[DEBUG RIFE IFNet] Output shape: {output.shape}")
+        return output

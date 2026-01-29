@@ -9,7 +9,44 @@ import einops
 import gc
 import torchvision.transforms.functional as transform
 from comfy.model_management import soft_empty_cache, get_torch_device
+import comfy.utils
+import sys
+
 import numpy as np
+
+class VFIProgressBar:
+    """A progress bar that displays both in ComfyUI UI and terminal"""
+    def __init__(self, total, desc="Comfy-VFI"):
+        self.total = total
+        self.n = 0
+        self.desc = desc
+        self.comfy_pbar = comfy.utils.ProgressBar(total)
+        self._print_terminal()
+    
+    def update(self, n=1):
+        self.n += n
+        self.comfy_pbar.update(n)
+        self._print_terminal()
+    
+    def _print_terminal(self):
+        if self.total > 0:
+            percent = 100 * (self.n / float(self.total))
+            bar_length = 40
+            filled_length = int(bar_length * self.n // self.total)
+            bar = '█' * filled_length + '-' * (bar_length - filled_length)
+            sys.stdout.write(f'\r{self.desc}: [{bar}] {percent:.1f}%')
+            sys.stdout.flush()
+            if self.n >= self.total:
+                sys.stdout.write('\n')
+                sys.stdout.flush()
+
+
+
+try:
+    import folder_paths
+    COMFY_FOLDER_PATHS_AVAILABLE = True
+except ImportError:
+    COMFY_FOLDER_PATHS_AVAILABLE = False
 
 BASE_MODEL_DOWNLOAD_URLS = [
     "https://github.com/styler00dollar/VSGAN-tensorrt-docker/releases/download/models/",
@@ -50,7 +87,16 @@ class MakeInterpolationStateList:
     CATEGORY = "ComfyUI-Frame-Interpolation/VFI"    
 
     def create_options(self, frame_indices: str, is_skip_list: bool):
-        frame_indices_list = [int(item) for item in frame_indices.split(',')]
+        # BUG DIAGNOSTIC LOGGING: Check for whitespace issues
+        raw_split = frame_indices.split(',')
+        print(f"[DEBUG] MakeInterpolationStateList: raw split result: {raw_split}")
+        try:
+            frame_indices_list = [int(item) for item in raw_split]
+        except ValueError as e:
+            print(f"[DEBUG] BUG FOUND! ValueError when converting to int: {e}")
+            print(f"[DEBUG] Attempting to strip whitespace and retry...")
+            frame_indices_list = [int(item.strip()) for item in raw_split]
+            print(f"[DEBUG] After stripping whitespace: {frame_indices_list}")
         
         interpolation_state_list = InterpolationStateList(
             frame_indices=frame_indices_list,
@@ -60,6 +106,20 @@ class MakeInterpolationStateList:
         
         
 def get_ckpt_container_path(model_type):
+    if COMFY_FOLDER_PATHS_AVAILABLE:
+        try:
+            # Use ComfyUI's standard models/checkpoints directory
+            checkpoints_paths = folder_paths.get_folder_paths("checkpoints")
+            if checkpoints_paths:
+                # Create path: models/checkpoints/vfi_models/{model_type}
+                comfy_vfi_path = os.path.join(checkpoints_paths[0], "vfi_models", model_type)
+                os.makedirs(comfy_vfi_path, exist_ok=True)
+                return os.path.abspath(comfy_vfi_path)
+        except Exception as e:
+            print(f"ComfyUI-Frame-Interpolation: Failed to use ComfyUI folder paths ({e}), falling back to local directory")
+    
+
+    # Fallback to original behavior
     return os.path.abspath(os.path.join(os.path.dirname(__file__), config["ckpts_path"], model_type))
 
 def load_file_from_url(url, model_dir=None, progress=True, file_name=None):
@@ -148,6 +208,10 @@ def _generic_frame_loop(
     out_len = 0
 
     number_of_frames_processed_since_last_cleared_cuda_cache = 0
+
+    # Initialize progress bar (both UI and terminal)
+    total_frames = len(frames) - 1
+    pbar = VFIProgressBar(total_frames, desc="Comfy-VFI")
     
     for frame_itr in range(len(frames) - 1): # Skip the final frame since there are no frames after it
         frame0 = frames[frame_itr:frame_itr+1]
@@ -186,12 +250,13 @@ def _generic_frame_loop(
         number_of_frames_processed_since_last_cleared_cuda_cache += 1
         # Try to avoid a memory overflow by clearing cuda cache regularly
         if number_of_frames_processed_since_last_cleared_cuda_cache >= clear_cache_after_n_frames:
-            print("Comfy-VFI: Clearing cache...", end=' ')
             soft_empty_cache()
             number_of_frames_processed_since_last_cleared_cuda_cache = 0
-            print("Done cache clearing")
         
         gc.collect()
+
+        # Update progress bar (both UI and terminal)
+        pbar.update(1)
     
     if final_logging:
         print(f"Comfy-VFI done! {len(output_frames)} frames generated at resolution: {output_frames[0].shape}")
@@ -199,11 +264,7 @@ def _generic_frame_loop(
     output_frames[out_len] = frames[-1:]
     out_len += 1
     # clear cache for courtesy
-    if final_logging:
-        print("Comfy-VFI: Final clearing cache...", end = ' ')
     soft_empty_cache()
-    if final_logging:
-        print("Done cache clearing")
     return output_frames[:out_len]
 
 def generic_frame_loop(

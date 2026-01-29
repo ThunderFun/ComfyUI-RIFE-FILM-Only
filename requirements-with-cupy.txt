@@ -7,4 +7,5 @@ scipy
 Pillow
 torchvision
 tqdm
-cupy-wheel
+# cupy-wheel
+cupy-cuda12x>=13.0.0
