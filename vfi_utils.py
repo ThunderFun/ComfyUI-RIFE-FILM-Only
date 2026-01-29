@@ -88,14 +88,10 @@ class MakeInterpolationStateList:
 
     def create_options(self, frame_indices: str, is_skip_list: bool):
         raw_split = frame_indices.split(',')
-        print(f"[DEBUG] MakeInterpolationStateList: raw split result: {raw_split}")
         try:
             frame_indices_list = [int(item) for item in raw_split]
-        except ValueError as e:
-            print(f"[DEBUG] BUG FOUND! ValueError when converting to int: {e}")
-            print(f"[DEBUG] Attempting to strip whitespace and retry...")
+        except ValueError:
             frame_indices_list = [int(item.strip()) for item in raw_split]
-            print(f"[DEBUG] After stripping whitespace: {frame_indices_list}")
         
         interpolation_state_list = InterpolationStateList(
             frame_indices=frame_indices_list,

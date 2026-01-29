@@ -119,8 +119,6 @@ class RIFE_VFI:
             To prevent memory overflow, it clears the CUDA cache after processing a specified number of frames.
         """
         
-        print(f"[DEBUG RIFE] Starting VFI with ckpt_name={ckpt_name}, multiplier={multiplier}, ensemble={ensemble}")
-        
         # Local import of the model definition to avoid circular imports
         from .rife_arch import IFNet
 
@@ -132,12 +130,10 @@ class RIFE_VFI:
 
         # Move model to correct device and set to eval mode
         device = get_torch_device()
-        print(f"[DEBUG RIFE] Using device: {device}")
         interpolation_model.eval().to(device)
 
         # Convert input frames from NHWC to NCHW and ensure float32 dtype
         frames = preprocess_frames(frames)
-        print(f"[DEBUG RIFE] Input frames shape after preprocess: {frames.shape}")
         dtype = torch.float32
 
         # Prepare per-frame multipliers (one per frame pair)
@@ -150,9 +146,6 @@ class RIFE_VFI:
 
         # Determine the scale list used by RIFE for multi-scale processing
         scale_list = [8 / scale_factor, 4 / scale_factor, 2 / scale_factor, 1 / scale_factor]
-        print(f"[DEBUG RIFE] Scale list: {scale_list}")
-        print(f"[DEBUG RIFE] Number of frame pairs to process: {num_pairs}")
-        print(f"[DEBUG RIFE] Multipliers per pair: {multipliers[:5]}... (showing first 5)")
 
         output_frames: typing.List[torch.Tensor] = []
         frames_processed_since_cache_clear = 0
@@ -176,11 +169,9 @@ class RIFE_VFI:
         results: typing.Dict[int, typing.List[torch.Tensor]] = {i: [] for i in range(len(frames) - 1)}
 
         # Initialize progress bar (both UI and terminal)
-        print(f"[DEBUG RIFE] Total interpolation tasks: {len(tasks)}")
         pbar = VFIProgressBar(len(tasks), desc="RIFE VFI")
 
         pos = 0
-        print(f"[DEBUG RIFE] Starting interpolation loop...")
         while pos < len(tasks):
             # Always process a single task at a time since batching is disabled.
             batch_tasks = tasks[pos : pos + 1]
@@ -239,7 +230,5 @@ class RIFE_VFI:
         soft_empty_cache()
 
         out_tensor = torch.cat(output_frames, dim=0)
-        print(f"[DEBUG RIFE] Final output tensor shape: {out_tensor.shape}")
         out_images = postprocess_frames(out_tensor)
-        print(f"[DEBUG RIFE] Final output images shape: {out_images.shape}")
         return (out_images,)

@@ -363,9 +363,6 @@ class IFNet(nn.Module):
         ensemble=False,
         return_flow=False,
     ):
-        print(f"[DEBUG RIFE IFNet] Forward called with arch_ver={self.arch_ver}, ensemble={ensemble}")
-        print(f"[DEBUG RIFE IFNet] Input shapes: img0={img0.shape}, img1={img1.shape}")
-        
         img0 = torch.clamp(img0, 0, 1)
         img1 = torch.clamp(img1, 0, 1)
 
@@ -566,5 +563,4 @@ class IFNet(nn.Module):
             merged[3] = warped_img0 * mask + warped_img1 * (1 - mask)
 
         output = merged[3][:, :, :h, :w]
-        print(f"[DEBUG RIFE IFNet] Output shape: {output.shape}")
         return output

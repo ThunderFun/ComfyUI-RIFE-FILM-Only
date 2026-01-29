@@ -141,10 +141,6 @@ class FILM_VFI:
         output_frames = [None] * total_output_frames
         output_index = 0
         
-        # BUG DIAGNOSTIC LOGGING: Track skipped frames
-        skipped_frames_count = 0
-        print(f"[DEBUG] FILM VFI: Total input frames: {len(frames)}, multipliers: {multipliers}")
-        print(f"[DEBUG] FILM VFI: Pre-allocated output size: {total_output_frames}")
 
         # Initialize progress bar (both UI and terminal)
         total_pairs = len(frames) - 1
@@ -152,9 +148,6 @@ class FILM_VFI:
 
         for frame_itr in range(len(frames) - 1):
             if interpolation_states is not None and interpolation_states.is_frame_skipped(frame_itr):
-                # BUG DIAGNOSTIC LOGGING
-                skipped_frames_count += 1
-                print(f"[DEBUG] FILM VFI: Skipping frame pair {frame_itr}")
                 continue
             
             # Ensure that input frames are in the same dtype as model
@@ -181,13 +174,6 @@ class FILM_VFI:
         
         # Filter out None values in case of skipped frames
         output_frames = [f for f in output_frames if f is not None]
-        
-        # BUG DIAGNOSTIC LOGGING: Check for size mismatch
-        actual_output_size = len(output_frames)
-        print(f"[DEBUG] FILM VFI: Skipped {skipped_frames_count} frame pairs")
-        print(f"[DEBUG] FILM VFI: Pre-allocated size: {total_output_frames}, Actual output size: {actual_output_size}")
-        if actual_output_size != total_output_frames - skipped_frames_count:
-            print(f"[DEBUG] BUG FOUND! Size mismatch detected!")
         
         out = torch.cat(output_frames, dim=0)
         
