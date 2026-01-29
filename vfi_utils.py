@@ -87,7 +87,6 @@ class MakeInterpolationStateList:
     CATEGORY = "ComfyUI-Frame-Interpolation/VFI"    
 
     def create_options(self, frame_indices: str, is_skip_list: bool):
-        # BUG DIAGNOSTIC LOGGING: Check for whitespace issues
         raw_split = frame_indices.split(',')
         print(f"[DEBUG] MakeInterpolationStateList: raw split result: {raw_split}")
         try:
