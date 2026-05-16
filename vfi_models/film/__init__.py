@@ -10,11 +10,9 @@ import comfy.utils
 import sys
 import warnings
 
-# Suppress PyTorch UserWarning about padding with even kernel lengths
 warnings.filterwarnings("ignore", message="Using padding='same' with even kernel lengths and odd dilation")
 
 class VFIProgressBar:
-    """A progress bar that displays both in ComfyUI UI and terminal"""
     def __init__(self, total, desc="FILM VFI"):
         self.total = total
         self.n = 0
@@ -43,18 +41,24 @@ MODEL_TYPE = pathlib.Path(__file__).parent.name
 DEVICE = get_torch_device()
 MODEL_CACHE = {}
 
-@torch.inference_mode()
-def inference(model, img_batch_1, img_batch_2, inter_frames, model_dtype):
-    results = [
-        img_batch_1,
-        img_batch_2
-    ]
+def clear_model_cache():
+    global MODEL_CACHE
+    for ckpt_name in list(MODEL_CACHE.keys()):
+        model, _ = MODEL_CACHE[ckpt_name]
+        del model
+        del MODEL_CACHE[ckpt_name]
+    MODEL_CACHE = {}
+    soft_empty_cache()
+    gc.collect()
 
+@torch.inference_mode()
+def inference(model, img_batch_1, img_batch_2, inter_frames, model_dtype, device):
+    results = [img_batch_1, img_batch_2]
     idxes = [0, inter_frames + 1]
     remains = list(range(1, inter_frames + 1))
-
-    splits = torch.linspace(0, 1, inter_frames + 2)
-
+    
+    splits = torch.linspace(0, 1, inter_frames + 2, device=device)
+    
     for _ in range(len(remains)):
         starts = splits[idxes[:-1]]
         ends = splits[idxes[1:]]
@@ -66,9 +70,8 @@ def inference(model, img_batch_1, img_batch_2, inter_frames, model_dtype):
         x0 = results[start_i]
         x1 = results[end_i]
         
-        # dt calculation
         dt_val = (splits[remains[step]] - splits[idxes[start_i]]) / (splits[idxes[end_i]] - splits[idxes[start_i]])
-        dt = torch.tensor([[dt_val]], device=DEVICE, dtype=model_dtype)
+        dt = torch.tensor([[dt_val]], device=device, dtype=model_dtype)
 
         prediction = model(x0, x1, dt)
         
@@ -76,6 +79,16 @@ def inference(model, img_batch_1, img_batch_2, inter_frames, model_dtype):
         idxes.insert(insert_position, remains[step])
         results.insert(insert_position, prediction.clamp(0, 1))
         del remains[step]
+        
+        if start_i > 0:
+            old_tensor = results[start_i - 1]
+            if old_tensor is not img_batch_1:
+                old_tensor.cpu()
+        
+        if end_i < len(results) - 1:
+            old_tensor = results[end_i + 1]
+            if old_tensor is not img_batch_2:
+                old_tensor.cpu()
 
     return results
 
@@ -109,14 +122,17 @@ class FILM_VFI:
         **kwargs
     ):
         interpolation_states = optional_interpolation_states
+        device = get_torch_device()
         
         if ckpt_name not in MODEL_CACHE:
+            soft_empty_cache()
+            gc.collect()
+            
             model_path = load_file_from_github_release(MODEL_TYPE, ckpt_name)
             model = torch.jit.load(model_path, map_location='cpu')
             model.eval()
-            model = model.to(DEVICE)
+            model = model.to(device)
             
-            # Determine model dtype
             try:
                 model_dtype = next(model.parameters()).dtype
             except StopIteration:
@@ -125,59 +141,58 @@ class FILM_VFI:
             MODEL_CACHE[ckpt_name] = (model, model_dtype)
         
         model, model_dtype = MODEL_CACHE[ckpt_name]
-        dtype = torch.float32
+        output_dtype = torch.float32
 
-        frames = preprocess_frames(frames).pin_memory()
-        number_of_frames_processed_since_last_cleared_cuda_cache = 0
+        frames_nchw = preprocess_frames(frames)
+        num_input_frames = len(frames_nchw)
         
         if isinstance(multiplier, int):
-            multipliers = [multiplier] * (len(frames) - 1)
+            multipliers = [multiplier] * (num_input_frames - 1)
         else:
             multipliers = list(map(int, multiplier))
-            multipliers += [2] * (len(frames) - len(multipliers) - 1)
+            multipliers += [2] * (num_input_frames - len(multipliers) - 1)
 
-        # Pre-allocate output list for better memory management
         total_output_frames = sum(multipliers) + 1
-        output_frames = [None] * total_output_frames
-        output_index = 0
+        output_frames = []
         
+        pbar = VFIProgressBar(num_input_frames - 1, desc="FILM VFI")
+        frames_processed = 0
 
-        # Initialize progress bar (both UI and terminal)
-        total_pairs = len(frames) - 1
-        pbar = VFIProgressBar(total_pairs, desc="FILM VFI")
-
-        for frame_itr in range(len(frames) - 1):
+        for frame_itr in range(num_input_frames - 1):
             if interpolation_states is not None and interpolation_states.is_frame_skipped(frame_itr):
+                output_frames.append(frames_nchw[frame_itr:frame_itr+1])
+                pbar.update(1)
                 continue
             
-            # Ensure that input frames are in the same dtype as model
-            frame_0 = frames[frame_itr:frame_itr+1].to(DEVICE, non_blocking=True).to(model_dtype)
-            frame_1 = frames[frame_itr+1:frame_itr+2].to(DEVICE, non_blocking=True).to(model_dtype)
+            frame_0 = frames_nchw[frame_itr:frame_itr+1].to(device, non_blocking=True).to(model_dtype)
+            frame_1 = frames_nchw[frame_itr+1:frame_itr+2].to(device, non_blocking=True).to(model_dtype)
             
-            # Use the recursive inference which is better for FILM's motion estimation
-            results = inference(model, frame_0, frame_1, multipliers[frame_itr] - 1, model_dtype)
+            results = inference(model, frame_0, frame_1, multipliers[frame_itr] - 1, model_dtype, device)
             
-            # Move results to CPU immediately to free GPU memory
-            for f in results[:-1]:
-                output_frames[output_index] = f.detach().to(device="cpu", dtype=dtype, non_blocking=True)
-                output_index += 1
-
-            number_of_frames_processed_since_last_cleared_cuda_cache += 1
-            if number_of_frames_processed_since_last_cleared_cuda_cache >= clear_cache_after_n_frames:
+            for i, f in enumerate(results[:-1]):
+                output_frames.append(f.detach().to(device="cpu", dtype=output_dtype, non_blocking=True))
+                if i > 0:
+                    del f
+            
+            del results
+            del frame_0, frame_1
+            
+            frames_processed += 1
+            if frames_processed >= clear_cache_after_n_frames:
                 soft_empty_cache()
-                number_of_frames_processed_since_last_cleared_cuda_cache = 0
+                gc.collect()
+                frames_processed = 0
 
-            # Update progress bar (both UI and terminal)
             pbar.update(1)
 
-        output_frames[output_index] = frames[-1:].to(dtype=dtype) # Append final frame
-        
-        # Filter out None values in case of skipped frames
-        output_frames = [f for f in output_frames if f is not None]
+        output_frames.append(frames_nchw[-1:].to(dtype=output_dtype))
         
         out = torch.cat(output_frames, dim=0)
+        del output_frames
         
         soft_empty_cache()
+        gc.collect()
+        
         return (postprocess_frames(out), )
 
 

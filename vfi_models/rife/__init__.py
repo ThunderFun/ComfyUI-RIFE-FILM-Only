@@ -5,6 +5,14 @@ from vfi_utils import load_file_from_github_release, preprocess_frames, postproc
 import typing
 from comfy.model_management import get_torch_device, soft_empty_cache
 import comfy.utils
+
+try:
+    from comfy.cli_args import enables_dynamic_vram
+    DYNAMIC_VRAM_AVAILABLE = True
+except ImportError:
+    DYNAMIC_VRAM_AVAILABLE = False
+    def enables_dynamic_vram():
+        return False
 import re
 from functools import cmp_to_key
 from packaging import version
@@ -126,7 +134,10 @@ class RIFE_VFI:
         model_path = load_file_from_github_release(MODEL_TYPE, ckpt_name)
         arch_ver = CKPT_NAME_VER_DICT[ckpt_name]
         interpolation_model = IFNet(arch_ver=arch_ver)
-        interpolation_model.load_state_dict(torch.load(model_path))
+        
+        # Use assign=True for dynamic VRAM support (zero-copy loading)
+        assign_enabled = DYNAMIC_VRAM_AVAILABLE and enables_dynamic_vram()
+        interpolation_model.load_state_dict(torch.load(model_path), assign=assign_enabled)
 
         # Move model to correct device and set to eval mode
         device = get_torch_device()
