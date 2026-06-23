@@ -118,8 +118,9 @@ class SubTreeExtractor(nn.Module):
         if head.device.type == 'cuda':
             head = head.to(memory_format=torch.channels_last)
 
-        # Pre-allocate pyramid list
-        pyramid = [torch.empty(0)] * n
+        # Pre-allocate pyramid list (len(convs), not n, because the loop
+        # iterates over all conv layers even when n < n_layers)
+        pyramid = [torch.empty(0)] * len(self.convs)
         for i, layer in enumerate(self.convs):
             head = layer(head)
             pyramid[i] = head
@@ -282,8 +283,7 @@ class Fusion(nn.Module):
             i = len(self.convs) - 1 - k
             # Resize the tensor from coarser level to match for concatenation.
             level_size = pyramid[i].shape[2:4]
-            # Use upsample_bilinear2d directly for speed if size is known
-            net = F.interpolate(net, size=level_size, mode='bilinear', align_corners=True)
+            net = F.interpolate(net, size=level_size, mode='nearest')
             net = layers[0](net)
             
             p_i = pyramid[i]
@@ -505,7 +505,7 @@ class Interpolator(nn.Module):
             x0 = x0.to(memory_format=torch.channels_last)
             x1 = x1.to(memory_format=torch.channels_last)
             
-        with torch.cuda.amp.autocast(enabled=device.type == 'cuda'):
+        with torch.amp.autocast("cuda", enabled=device.type == 'cuda'):
             result = self.debug_forward(x0, x1, batch_dt)['image'][0]
             
         return result
@@ -633,13 +633,13 @@ class PyramidFlowEstimator(nn.Module):
         for i in range(levels - 2, -1, -1):
             # Upsample flow
             level_size = feature_pyramid_a[i].shape[2:4]
-            v = F.interpolate(2 * v, size=level_size, mode='bilinear', align_corners=True)
+            v = F.interpolate(2 * v, size=level_size, mode='bilinear', align_corners=False)
             
             # Warp features from B using current flow
             warped = warp(feature_pyramid_b[i], v)
             
             # Use specialized predictor if available for this level, else use the share one
-            predictor = self._predictors[i] if i < num_specialized else self._predictor
+            predictor = self._predictors[num_specialized - 1 - i] if i < num_specialized else self._predictor
             
             v_residual = predictor(feature_pyramid_a[i], warped)
             residuals[i] = v_residual
@@ -723,8 +723,8 @@ def warp(image: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
     grid_base, scale = _GRID_CACHE[cache_key]
     grid = grid_base.expand(batch, -1, -1, -1)
     
-    # Scale flow and subtract from grid
-    grid = grid - flow.permute(0, 2, 3, 1) * scale
+    # Scale flow and add to grid (backward warp: sample at pixel + flow)
+    grid = grid + flow.permute(0, 2, 3, 1) * scale
 
     padding_mode = "border"
     if device.type == "mps":
@@ -760,7 +760,7 @@ def flow_pyramid_synthesis(
         i = n - 2 - k
         residual_flow = residual_pyramid[i]
         level_size = residual_flow.shape[2:4]
-        flow = F.interpolate(2 * flow, size=level_size, mode='bilinear', align_corners=True)
+        flow = F.interpolate(2 * flow, size=level_size, mode='bilinear', align_corners=False)
         flow = residual_flow + flow
         flow_pyramid[i] = flow
     return flow_pyramid

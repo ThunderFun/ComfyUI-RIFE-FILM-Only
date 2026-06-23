@@ -18,6 +18,7 @@ from functools import cmp_to_key
 from packaging import version
 import gc
 import sys
+import time
 
 class VFIProgressBar:
     """A progress bar that displays both in ComfyUI UI and terminal"""
@@ -25,6 +26,7 @@ class VFIProgressBar:
         self.total = total
         self.n = 0
         self.desc = desc
+        self.start_time = time.perf_counter()
         self.comfy_pbar = comfy.utils.ProgressBar(total)
         self._print_terminal()
     
@@ -42,7 +44,8 @@ class VFIProgressBar:
             sys.stdout.write(f'\r{self.desc}: [{bar}] {percent:.1f}%')
             sys.stdout.flush()
             if self.n >= self.total:
-                sys.stdout.write('\n')
+                elapsed = time.perf_counter() - self.start_time
+                sys.stdout.write(f'\n{self.desc} completed in {elapsed:.1f}s\n')
                 sys.stdout.flush()
 
 MODEL_TYPE = pathlib.Path(__file__).parent.name
@@ -58,6 +61,8 @@ CKPT_NAME_VER_DICT = {
     "rife47.pth": "4.7",
     "rife48.pth": "4.7",
     "rife49.pth": "4.7",
+    "rife417.pth": "4.17",
+    "rife426.pth": "4.26",
     "sudo_rife4_269.662_testV1_scale1.pth": "4.0"
     # Arch 4.10 doesn't work due to state dict mismatch
     # "rife410.pth": "4.10",
@@ -67,27 +72,64 @@ CKPT_NAME_VER_DICT = {
 
 
 class RIFE_VFI:
+    """Real-Time Intermediate Flow Estimation video frame interpolation.
+
+    RIFE uses an IFNet to directly estimate the intermediate optical flow and
+    fusion mask between two frames via a coarse-to-fine stack of IFBlocks, then
+    reconstructs the in-between frame. See the RIFE paper in Papers/ for details.
+    """
+
+    DESCRIPTION = ("RIFE: Real-time Intermediate Flow Estimation for Video Frame Interpolation. "
+                    "Synthesizes new frames between each pair of input frames using a flow-based "
+                    "IFNet. Supports arbitrary-timestep interpolation, so it scales to any frame "
+                    "multiplier. Hover the individual options below for what each one does.")
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "ckpt_name": (
-                    sorted(list(CKPT_NAME_VER_DICT.keys()), key=lambda ckpt_name: version.parse(CKPT_NAME_VER_DICT[ckpt_name])),
-                    {"default": "rife47.pth"}
+                    sorted(list(CKPT_NAME_VER_DICT.keys()), key=lambda ckpt_name: version.parse(CKPT_NAME_VER_DICT[ckpt_name]), reverse=True),
+                    {"default": "rife47.pth", "tooltip":
+                        "RIFE model weights to use. The list is sorted newest-first by architecture version. "
+                        "Newer versions (e.g. 4.26, 4.17, 4.7) generally produce higher quality, while older "
+                        "ones (4.0-4.3) are the only ones that support the RefineNet step controlled by 'fast_mode'. "
+                        "The 'sudo_rife4_269...' entry is a community fine-tuned variant built on the 4.0 architecture."}
                 ),
-                "frames": ("IMAGE", ),
-                "clear_cache_after_n_frames": ("INT", {"default": 10, "min": 1, "max": 1000}),
-                "multiplier": ("INT", {"default": 2, "min": 1}),
-                "ensemble": ("BOOLEAN", {"default": True}),
-                "scale_factor": ([0.25, 0.5, 1.0, 2.0, 4.0], {"default": 1.0})
+                "frames": ("IMAGE", {"tooltip":
+                    "The input video frames to interpolate between. Connect an IMAGE batch here. "
+                    "At least 2 frames are required; RIFE synthesizes the frames that go between each consecutive pair."}),
+                "clear_cache_after_n_frames": ("INT", {"default": 10, "min": 1, "max": 1000, "tooltip":
+                    "How many frame pairs to process before clearing the GPU (CUDA) cache to avoid out-of-memory errors. "
+                    "Lower values are safer for high-resolution inputs or large multipliers but slightly slower due to more "
+                    "frequent cache clears. Raise it (e.g. 50-100) if you have spare VRAM and want maximum speed."}),
+                "multiplier": ("INT", {"default": 2, "min": 1, "tooltip":
+                    "How many times to multiply the frame rate. 2x inserts one new frame between each pair (doubles fps); "
+                    "4x inserts three, etc. Because RIFE supports arbitrary timesteps via its temporal encoding, large "
+                    "multipliers are handled directly without recursively re-interpolating. E.g. 60 input frames x 2 = 120 output."}),
+                "fast_mode": ("BOOLEAN", {"default": True, "tooltip":
+                    "When ON (default), skips the RefineNet post-processing pass for maximum speed. "
+                    "When OFF, enables RefineNet (a ContextNet + U-Net) which refines high-frequency detail and reduces "
+                    "artifacts - this roughly doubles compute. NOTE: RefineNet only exists in architectures 4.0, 4.2 and 4.3; "
+                    "on 4.5 and newer this option has no effect (those models refine within the IFNet already)."}),
+                "ensemble": ("BOOLEAN", {"default": True, "tooltip":
+                    "When ON, each IFBlock is run twice (once with the frame order as given, once reversed) and the predicted "
+                    "flows/masks are averaged. This improves quality and robustness at the cost of roughly doubling inference time. "
+                    "Forced OFF automatically for the 4.26 architecture, which does not implement ensemble averaging."}),
+                "scale_factor": ([0.25, 0.5, 1.0, 2.0, 4.0], {"default": 1.0, "tooltip":
+                    "Controls the coarse-to-fine resolution pyramid used inside the IFBlocks. Internally the frame is downscaled "
+                    "by [8/x, 4/x, 2/x, 1/x] at successive stages (1/x of native at the finest stage). "
+                    "1.0 = native RIFE behaviour. Higher values (2.0, 4.0) process at lower internal resolution -> faster and "
+                    "lighter on VRAM but blurrier. Lower values (0.5, 0.25) raise the internal resolution -> sharper but slower "
+                    "and more memory-hungry."})
             },
             "optional": {
-                "optional_interpolation_states": ("INTERPOLATION_STATES", )
+                "optional_interpolation_states": ("INTERPOLATION_STATES", {"tooltip":
+                    "Optional. Connect a 'Make Interpolation State List' node to selectively skip or include specific frame "
+                    "pairs for interpolation. If left unconnected, every consecutive pair of frames is interpolated."})
             }
         }
 
-    # ComfyUI uses RETURN_TYPES and FUNCTION to determine how to wire nodes
     RETURN_TYPES = ("IMAGE", )
     FUNCTION = "vfi"
     CATEGORY = "ComfyUI-Frame-Interpolation/VFI"
@@ -98,50 +140,45 @@ class RIFE_VFI:
         frames: torch.Tensor,
         clear_cache_after_n_frames = 10,
         multiplier: typing.SupportsInt = 2,
+        fast_mode: bool = True,
         ensemble = False,
         scale_factor = 1.0,
         optional_interpolation_states: InterpolationStateList = None,
         **kwargs
     ):
-        """
-        Perform video frame interpolation using a given checkpoint model.
-    
-        Args:
-            ckpt_name (str): The name of the checkpoint model to use.
-            frames (torch.Tensor): A tensor containing input video frames.
-            clear_cache_after_n_frames (int, optional): The number of frames to process before clearing CUDA cache
-                to prevent memory overflow. Defaults to 10. Lower numbers are safer but mean more processing time.
-                How high you should set it depends on how many input frames there are, input resolution (after upscaling),
-                how many times you want to multiply them, and how long you're willing to wait for the process to complete.
-            multiplier (int, optional): The multiplier for each input frame. 60 input frames * 2 = 120 output frames. Defaults to 2.
-            ensemble (bool, optional): Whether to use ensemble mode for better quality. Defaults to True.
-            scale_factor (float, optional): Scale factor for multi-scale processing. Defaults to 1.0.
-    
-        Returns:
-            tuple: A tuple containing the output interpolated frames.
-    
-        Note:
-            This method interpolates frames in a video sequence using a specified checkpoint model.
-            It processes each frame sequentially, generating interpolated frames between them.
-    
-            To prevent memory overflow, it clears the CUDA cache after processing a specified number of frames.
-        """
-        
         # Local import of the model definition to avoid circular imports
         from .rife_arch import IFNet
 
         # Resolve the checkpoint path and instantiate the model
         model_path = load_file_from_github_release(MODEL_TYPE, ckpt_name)
         arch_ver = CKPT_NAME_VER_DICT[ckpt_name]
+
+        # 4.26 disables ensemble at runtime
+        if arch_ver == "4.26":
+            ensemble = False
+
         interpolation_model = IFNet(arch_ver=arch_ver)
         
         # Use assign=True for dynamic VRAM support (zero-copy loading)
         assign_enabled = DYNAMIC_VRAM_AVAILABLE and enables_dynamic_vram()
-        interpolation_model.load_state_dict(torch.load(model_path), assign=assign_enabled)
 
-        # Move model to correct device and set to eval mode
+        state_dict = torch.load(model_path)
+        # Some RIFE checkpoints bundle training-only modules that are not part of
+        # the inference IFNet (e.g. a "teacher" network used for knowledge
+        # distillation and a "caltime" timestep-calibration MLP). These show up
+        # as unexpected keys and make load_state_dict fail. Strip any key that
+        # does not map to a model parameter/buffer so we can keep strict loading,
+        # which still catches genuine parameter mismatches.
+        model_keys = set(interpolation_model.state_dict().keys())
+        state_dict = {k: v for k, v in state_dict.items() if k in model_keys}
+        interpolation_model.load_state_dict(state_dict, assign=assign_enabled)
+
         device = get_torch_device()
         interpolation_model.eval().to(device)
+
+        # Free the CPU checkpoint copy now that the model lives on-device.
+        del state_dict
+        gc.collect()
 
         # Convert input frames from NHWC to NCHW and ensure float32 dtype
         frames = preprocess_frames(frames)
@@ -155,10 +192,12 @@ class RIFE_VFI:
             multipliers = list(map(int, multiplier))
             multipliers += [2] * (num_pairs - len(multipliers))
 
-        # Determine the scale list used by RIFE for multi-scale processing
-        scale_list = [8 / scale_factor, 4 / scale_factor, 2 / scale_factor, 1 / scale_factor]
+        # Scale list for multi-scale processing (4.26 uses 5 stages instead of 4)
+        if arch_ver == "4.26":
+            scale_list = [16 / scale_factor, 8 / scale_factor, 4 / scale_factor, 2 / scale_factor, 1 / scale_factor]
+        else:
+            scale_list = [8 / scale_factor, 4 / scale_factor, 2 / scale_factor, 1 / scale_factor]
 
-        output_frames: typing.List[torch.Tensor] = []
         frames_processed_since_cache_clear = 0
 
         # Build a list of interpolation tasks across all frame pairs. Each task is a
@@ -166,37 +205,58 @@ class RIFE_VFI:
         # Pairs that are skipped via optional_interpolation_states have no tasks.
         tasks: typing.List[typing.Tuple[int, float]] = []
         num_tasks_per_pair: typing.Dict[int, int] = {}
+        # Output layout: for each non-skipped pair we reserve a run of slots for
+        # its interpolated frames. mid_offsets[pair_idx] is the output index where
+        # the first interpolated frame for that pair should be written.
+        mid_offsets: typing.Dict[int, int] = {}
+        total_output = 0
         for pair_idx in range(len(frames) - 1):
+            total_output += 1  # leading original frame
             if optional_interpolation_states is not None and optional_interpolation_states.is_frame_skipped(pair_idx):
                 num_tasks_per_pair[pair_idx] = 0
                 continue
             m = multipliers[pair_idx]
             n = max(m - 1, 0)
             num_tasks_per_pair[pair_idx] = n
+            if n > 0:
+                mid_offsets[pair_idx] = total_output
+            total_output += n
             for step in range(1, m):
                 tasks.append((pair_idx, step / m))
+        total_output += 1  # trailing original frame
 
-        # Dictionary mapping pair index to list of intermediate frames
-        results: typing.Dict[int, typing.List[torch.Tensor]] = {i: [] for i in range(len(frames) - 1)}
+        # Preallocate a single contiguous output buffer. Interpolated frames are
+        # written directly into their final positions during the task loop, avoiding
+        # an intermediate dict accumulation and torch.cat at the end.
+        output_frames = torch.zeros(
+            total_output, *frames.shape[1:], dtype=dtype, device="cpu"
+        )
 
-        # Initialize progress bar (both UI and terminal)
+        # Place every original frame in its final position up front (cheap copies).
+        fill_pos = 0
+        for pair_idx in range(len(frames) - 1):
+            output_frames[fill_pos] = frames[pair_idx]
+            fill_pos += 1
+            if pair_idx in mid_offsets:
+                fill_pos += multipliers[pair_idx] - 1
+        output_frames[fill_pos] = frames[-1]
+
+        mid_written: typing.Dict[int, int] = {pair_idx: 0 for pair_idx in mid_offsets}
+
         pbar = VFIProgressBar(len(tasks), desc="RIFE VFI")
 
         pos = 0
         while pos < len(tasks):
             # Always process a single task at a time since batching is disabled.
             batch_tasks = tasks[pos : pos + 1]
-            # prepare lists
             frame0_list: typing.List[torch.Tensor] = []
             frame1_list: typing.List[torch.Tensor] = []
             timestep_list: typing.List[float] = []
             for (pair_idx, dt) in batch_tasks:
-                frame0_cpu = frames[pair_idx:pair_idx+1]
-                frame1_cpu = frames[pair_idx+1:pair_idx+2]
-                frame0_list.append(frame0_cpu)
-                frame1_list.append(frame1_cpu)
+                frame0_list.append(frames[pair_idx:pair_idx+1])
+                frame1_list.append(frames[pair_idx+1:pair_idx+2])
                 timestep_list.append(dt)
-            # combine and move to device
+            # Move frames to device
             frame0_batch = torch.cat(frame0_list, dim=0).to(device).to(dtype)
             frame1_batch = torch.cat(frame1_list, dim=0).to(device).to(dtype)
             timestep_tensor = torch.tensor(timestep_list, dtype=dtype, device=device).view(-1, 1, 1, 1)
@@ -207,15 +267,17 @@ class RIFE_VFI:
                     frame1_batch,
                     timestep_tensor,
                     scale_list,
-                    training=False,
-                    ensemble=ensemble
+                    False,       # training=False (inference mode)
+                    fast_mode,   # fastmode
+                    ensemble,    # ensemble
                 ).clamp(0, 1)
 
-            middle_frames_cpu = middle_frames.detach().cpu().to(dtype)
+            middle_frames_cpu = middle_frames.detach().to(dtype=dtype, device="cpu")
 
-            # assign outputs
             for idx, (pair_idx, _dt) in enumerate(batch_tasks):
-                results[pair_idx].append(middle_frames_cpu[idx:idx+1])
+                write_pos = mid_offsets[pair_idx] + mid_written[pair_idx]
+                output_frames[write_pos] = middle_frames_cpu[idx]
+                mid_written[pair_idx] += 1
                 num_tasks_per_pair[pair_idx] -= 1
                 if num_tasks_per_pair[pair_idx] == 0:
                     frames_processed_since_cache_clear += 1
@@ -223,23 +285,17 @@ class RIFE_VFI:
                         soft_empty_cache()
                         frames_processed_since_cache_clear = 0
                         gc.collect()
-            # Update progress bar (both UI and terminal)
             pbar.update(len(batch_tasks))
             pos += len(batch_tasks)
 
-        # Assemble the final output: original frames with their interpolated frames
-        for frame_idx in range(len(frames) - 1):
-            frame0_cpu = frames[frame_idx:frame_idx+1]
-            output_frames.append(frame0_cpu.to(dtype=dtype))
-            # append intermediate frames if pair not skipped
-            if optional_interpolation_states is None or not optional_interpolation_states.is_frame_skipped(frame_idx):
-                for mid in results[frame_idx]:
-                    output_frames.append(mid)
-        # append last frame
-        output_frames.append(frames[-1:].to(dtype=dtype))
-
+        # Free the model and GPU cache before the final CPU-side rearrange.
+        del interpolation_model
         soft_empty_cache()
+        gc.collect()
 
-        out_tensor = torch.cat(output_frames, dim=0)
-        out_images = postprocess_frames(out_tensor)
+        # postprocess_frames allocates a second full-size tensor (NCHW -> NHWC).
+        # Release the original buffer immediately to keep peak RAM at ~2x.
+        out_images = postprocess_frames(output_frames)
+        del output_frames
+        gc.collect()
         return (out_images,)

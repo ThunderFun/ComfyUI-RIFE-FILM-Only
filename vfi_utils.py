@@ -11,6 +11,7 @@ import torchvision.transforms.functional as transform
 from comfy.model_management import soft_empty_cache, get_torch_device
 import comfy.utils
 import sys
+import time
 
 import numpy as np
 
@@ -20,6 +21,7 @@ class VFIProgressBar:
         self.total = total
         self.n = 0
         self.desc = desc
+        self.start_time = time.perf_counter()
         self.comfy_pbar = comfy.utils.ProgressBar(total)
         self._print_terminal()
     
@@ -37,7 +39,8 @@ class VFIProgressBar:
             sys.stdout.write(f'\r{self.desc}: [{bar}] {percent:.1f}%')
             sys.stdout.flush()
             if self.n >= self.total:
-                sys.stdout.write('\n')
+                elapsed = time.perf_counter() - self.start_time
+                sys.stdout.write(f'\n{self.desc} completed in {elapsed:.1f}s\n')
                 sys.stdout.flush()
 
 
@@ -58,7 +61,7 @@ config_path = os.path.join(os.path.dirname(__file__), "./config.yaml")
 if os.path.exists(config_path):
     config = yaml.load(open(config_path, "r"), Loader=yaml.FullLoader)
 else:
-    raise Exception("config.yaml file is neccessary, plz recreate the config file by downloading it from https://github.com/Fannovel16/ComfyUI-Frame-Interpolation")
+    raise Exception("config.yaml not found. Download it from https://github.com/Fannovel16/ComfyUI-Frame-Interpolation")
 DEVICE = get_torch_device()
 
 class InterpolationStateList():
@@ -118,9 +121,7 @@ def get_ckpt_container_path(model_type):
     return os.path.abspath(os.path.join(os.path.dirname(__file__), config["ckpts_path"], model_type))
 
 def load_file_from_url(url, model_dir=None, progress=True, file_name=None):
-    """Load file form http url, will download models if necessary.
-
-    Ref:https://github.com/1adrianb/face-alignment/blob/master/face_alignment/utils.py
+    """Download a file from a URL if not already cached locally.
 
     Args:
         url (str): URL to be downloaded.
@@ -160,7 +161,7 @@ def load_file_from_github_release(model_type, ckpt_name):
             error_strs.append(f"Error when downloading from: {base_model_download_url + ckpt_name}\n\n{traceback_str}")
 
     error_str = '\n\n'.join(error_strs)
-    raise Exception(f"Tried all GitHub base urls to download {ckpt_name} but no suceess. Below is the error log:\n\n{error_str}")
+    raise Exception(f"Tried all GitHub base URLs to download {ckpt_name} but none succeeded. Error log:\n\n{error_str}")
                 
 
 def load_file_from_direct_url(model_type, url):
@@ -187,7 +188,7 @@ def _generic_frame_loop(
         dtype=torch.float16,
         final_logging=True):
     
-    #https://github.com/hzwer/Practical-RIFE/blob/main/inference_video.py#L169
+    # Non-timestep recursive bisection (used by models without arbitrary-timestep support)
     def non_timestep_inference(frame0, frame1, n):        
         middle = return_middle_frame_function(frame0, frame1, None, *return_middle_frame_function_args)
         if n == 1:
@@ -208,9 +209,9 @@ def _generic_frame_loop(
     total_frames = len(frames) - 1
     pbar = VFIProgressBar(total_frames, desc="Comfy-VFI")
     
-    for frame_itr in range(len(frames) - 1): # Skip the final frame since there are no frames after it
+    for frame_itr in range(len(frames) - 1):
         frame0 = frames[frame_itr:frame_itr+1]
-        output_frames[out_len] = frame0 # Start with first frame
+        output_frames[out_len] = frame0
         out_len += 1
         # Ensure that input frames are in fp32 - the same dtype as model
         frame0 = frame0.to(dtype=torch.float32)
@@ -219,7 +220,6 @@ def _generic_frame_loop(
         if interpolation_states is not None and interpolation_states.is_frame_skipped(frame_itr):
             continue
     
-        # Generate and append a batch of middle frames
         middle_frame_batches = []
 
         if use_timestep:
@@ -237,28 +237,23 @@ def _generic_frame_loop(
             middle_frames = non_timestep_inference(frame0.to(DEVICE), frame1.to(DEVICE), multiplier - 1)
             middle_frame_batches.extend(torch.cat(middle_frames, dim=0).detach().cpu().to(dtype=dtype))
         
-        # Copy middle frames to output
         for middle_frame in middle_frame_batches:
             output_frames[out_len] = middle_frame
             out_len += 1
 
         number_of_frames_processed_since_last_cleared_cuda_cache += 1
-        # Try to avoid a memory overflow by clearing cuda cache regularly
         if number_of_frames_processed_since_last_cleared_cuda_cache >= clear_cache_after_n_frames:
             soft_empty_cache()
             number_of_frames_processed_since_last_cleared_cuda_cache = 0
         
         gc.collect()
 
-        # Update progress bar (both UI and terminal)
         pbar.update(1)
     
     if final_logging:
         print(f"Comfy-VFI done! {len(output_frames)} frames generated at resolution: {output_frames[0].shape}")
-    # Append final frame
     output_frames[out_len] = frames[-1:]
     out_len += 1
-    # clear cache for courtesy
     soft_empty_cache()
     return output_frames[:out_len]
 
@@ -328,24 +323,3 @@ class FloatToInt:
         if hasattr(float, "__iter__"):
             return (list(map(int, float)),)
         return (int(float),)
-
-""" def generic_4frame_loop(
-        frames,
-        clear_cache_after_n_frames,
-        multiplier: typing.SupportsInt,
-        return_middle_frame_function,
-        *return_middle_frame_function_args,
-        interpolation_states: InterpolationStateList = None,
-        use_timestep=False):
-    
-    if use_timestep: raise NotImplementedError("Timestep 4 frame VFI model")
-    def non_timestep_inference(frame_0, frame_1, frame_2, frame_3, n):        
-        middle = return_middle_frame_function(frame_0, frame_1, None, *return_middle_frame_function_args)
-        if n == 1:
-            return [middle]
-        first_half = non_timestep_inference(frame_0, middle, n=n//2)
-        second_half = non_timestep_inference(middle, frame_1, n=n//2)
-        if n%2:
-            return [*first_half, middle, *second_half]
-        else:
-            return [*first_half, *second_half] """
