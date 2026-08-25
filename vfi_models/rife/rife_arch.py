@@ -11,10 +11,74 @@ Based on: https://github.com/hzwer/Practical-RIFE
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from comfy.model_management import get_torch_device
+from collections import OrderedDict
 
-device = get_torch_device()
-backwarp_tenGrid = {}
+# Bounded cache of the sampling grids used by warp(). Keyed by device and
+# shape so multi-resolution runs (the coarse-to-fine IFBlocks and, on
+# 4.0/4.2/4.3 with fast_mode off, the refine-net warps at 1/2..1/16 scales)
+# reuse grids instead of reallocating them. Bounded so a long ComfyUI
+# session at many resolutions does not accumulate one ~16 MiB grid per size.
+#
+# The grid stays fp32 on purpose: a bf16 grid quantizes coordinates to
+# ~4e-3 spacing near magnitude 1, which collapses adjacent pixel offsets
+# (e.g. 1920 columns span [-1,1] with ~1e-3 spacing, finer than bf16 can
+# represent). Low-precision warp inputs are upcast for the grid lookup in
+# warp() itself.
+_WARP_GRID_CACHE_MAX = 8
+backwarp_tenGrid = OrderedDict()
+
+
+def clear_warp_grid_cache():
+    backwarp_tenGrid.clear()
+
+
+def warp(tenInput, tenFlow):
+    dev = tenFlow.device
+    key = (str(dev), tenFlow.shape)
+    grid = backwarp_tenGrid.get(key)
+    if grid is None:
+        tenHorizontal = (
+            torch.linspace(-1.0, 1.0, tenFlow.shape[3], device=dev)
+            .view(1, 1, 1, tenFlow.shape[3])
+            .expand(tenFlow.shape[0], -1, tenFlow.shape[2], -1)
+        )
+        tenVertical = (
+            torch.linspace(-1.0, 1.0, tenFlow.shape[2], device=dev)
+            .view(1, 1, tenFlow.shape[2], 1)
+            .expand(tenFlow.shape[0], -1, -1, tenFlow.shape[3])
+        )
+        grid = torch.cat([tenHorizontal, tenVertical], 1)
+        backwarp_tenGrid[key] = grid
+        if len(backwarp_tenGrid) > _WARP_GRID_CACHE_MAX:
+            backwarp_tenGrid.popitem(last=False)
+    else:
+        backwarp_tenGrid.move_to_end(key)
+
+    tenFlow = torch.cat(
+        [
+            tenFlow[:, 0:1, :, :] / ((tenInput.shape[3] - 1.0) / 2.0),
+            tenFlow[:, 1:2, :, :] / ((tenInput.shape[2] - 1.0) / 2.0),
+        ],
+        1,
+    )
+
+    g = (grid + tenFlow).permute(0, 2, 3, 1)
+
+    if g.dtype != tenInput.dtype:
+        g = g.to(tenInput.dtype)
+
+    padding_mode = "border"
+    if tenInput.device.type == "mps":
+        # https://github.com/pytorch/pytorch/issues/125098
+        padding_mode = "zeros"
+        g = g.clamp(-1, 1)
+    return torch.nn.functional.grid_sample(
+        input=tenInput,
+        grid=g,
+        mode="bilinear",
+        padding_mode=padding_mode,
+        align_corners=True,
+    )
 
 
 class ResConv(nn.Module):
@@ -26,48 +90,6 @@ class ResConv(nn.Module):
 
     def forward(self, x):
         return self.relu(self.conv(x) * self.beta + x)
-
-
-def warp(tenInput, tenFlow):
-    k = (str(tenFlow.device), str(tenFlow.size()))
-    if k not in backwarp_tenGrid:
-        tenHorizontal = (
-            torch.linspace(-1.0, 1.0, tenFlow.shape[3], device=device)
-            .view(1, 1, 1, tenFlow.shape[3])
-            .expand(tenFlow.shape[0], -1, tenFlow.shape[2], -1)
-        )
-        tenVertical = (
-            torch.linspace(-1.0, 1.0, tenFlow.shape[2], device=device)
-            .view(1, 1, tenFlow.shape[2], 1)
-            .expand(tenFlow.shape[0], -1, -1, tenFlow.shape[3])
-        )
-        backwarp_tenGrid[k] = torch.cat([tenHorizontal, tenVertical], 1).to(device)
-
-    tenFlow = torch.cat(
-        [
-            tenFlow[:, 0:1, :, :] / ((tenInput.shape[3] - 1.0) / 2.0),
-            tenFlow[:, 1:2, :, :] / ((tenInput.shape[2] - 1.0) / 2.0),
-        ],
-        1,
-    )
-
-    g = (backwarp_tenGrid[k] + tenFlow).permute(0, 2, 3, 1)
-
-    if g.dtype != tenInput.dtype:
-        g = g.to(tenInput.dtype)
-
-    padding_mode = "border"
-    if device.type == "mps":
-        # https://github.com/pytorch/pytorch/issues/125098
-        padding_mode = "zeros"
-        g = g.clamp(-1, 1)
-    return torch.nn.functional.grid_sample(
-        input=tenInput,
-        grid=g,
-        mode="bilinear",
-        padding_mode=padding_mode,
-        align_corners=True,
-    )
 
 
 def conv(
