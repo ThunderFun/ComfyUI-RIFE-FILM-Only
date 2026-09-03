@@ -226,15 +226,18 @@ def _parse_fps(value, name):
 
 
 def resolve_fps_mode(vfi_name, source_fps, target_fps, video_info=None):
-    """Merge an optional VHS video_info dict into source_fps and validate the pair.
+    """Merge an optional VHS video_info dict into source_fps and pick the mode.
 
     VHS loaders report the rate of the frames they actually delivered as
-    'loaded_fps', after force_rate and select_every_nth. That rate is what
-    the IMAGE batch contains, so it is used as source_fps. Setting source_fps
-    manually while video_info is connected is ambiguous and raises.
+    'loaded_fps', after force_rate and select_every_nth. The IMAGE batch
+    contains frames at that rate, so it becomes source_fps. Setting
+    source_fps manually while video_info is connected is ambiguous and raises.
 
-    Returns (source_fps, fps_mode); fps_mode is True only for a complete,
-    positive (source_fps, target_fps) pair.
+    fps mode (output sampled on the exact target-fps grid) requires both
+    rates. source_fps alone runs multiplier mode and scales the frame_rate
+    output; target_fps alone is unusable and raises.
+
+    Returns (source_fps, fps_mode).
     """
     if video_info is not None:
         if source_fps > 0:
@@ -244,17 +247,23 @@ def resolve_fps_mode(vfi_name, source_fps, target_fps, video_info=None):
         source_fps = float(video_info.get("loaded_fps", 0))
         if source_fps <= 0:
             raise ValueError(f"{vfi_name}: connected video_info has no usable 'loaded_fps'.")
-    fps_mode = (source_fps > 0) or (target_fps > 0)
-    if fps_mode and not (source_fps > 0 and target_fps > 0):
-        if video_info is not None:
-            raise ValueError(
-                f"{vfi_name}: video_info is connected but target_fps is not set. "
-                "Set target_fps to use the detected fps, or disconnect video_info and leave "
-                "both fps inputs at 0 to use the 'multiplier' input instead.")
+    if target_fps > 0 and source_fps <= 0:
         raise ValueError(
-            f"{vfi_name}: source_fps and target_fps must be provided together "
-            "(leave both at 0 to use the 'multiplier' input instead).")
-    return source_fps, fps_mode
+            f"{vfi_name}: target_fps is set but the input frame rate is unknown; "
+            "set source_fps or connect a Video Helper Suite video_info.")
+    return source_fps, source_fps > 0 and target_fps > 0
+
+
+def multiplier_output_fps(source_fps, multipliers, any_skipped=False):
+    """Frame rate of a multiplier-mode output batch.
+
+    The source rate times the uniform per-pair multiplier. 0.0 when the input
+    rate is unknown, per-pair multipliers are uneven, or skipped pairs make
+    the timing non-uniform.
+    """
+    if source_fps <= 0 or not multipliers or len(set(multipliers)) != 1 or any_skipped:
+        return 0.0
+    return source_fps * multipliers[0]
 
 
 def compute_fps_schedule(
