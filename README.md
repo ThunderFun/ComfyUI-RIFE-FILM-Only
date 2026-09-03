@@ -1,26 +1,32 @@
-# ComfyUI Frame Interpolation - FILM and RIFE Only
+# ComfyUI-RIFE-FILM-Only
 
-A custom node set for Video Frame Interpolation in ComfyUI, containing only FILM and RIFE models.
+A fork of [ComfyUI-Frame-Interpolation](https://github.com/Fannovel16/ComfyUI-Frame-Interpolation) for video frame interpolation in ComfyUI, keeping only the FILM and RIFE models.
+
+> **WARNING:** This code has not been thoroughly tested.
+
+*Fork modifications developed with AI assistance.*
+
+**FILM VFI Improvements:**
+* Performance optimizations
+* Support for the FP16 checkpoint [`film_net_fp16.pt`](https://huggingface.co/jkawamoto/frame-interpolation-pytorch/blob/main/film_net_fp16.pt)
+
+**Other Changes:**
+* Removed all other interpolation methods - this fork contains only FILM and RIFE models
+* Bug fixes
+* Support for RIFE 4.25
+* Node options for optionally targeting source and target FPS
+
+## Nodes
+* RIFE VFI (4.6 - 4.26)
+* FILM VFI (FP16 and FP32)
+* Make Interpolation State List
+* VFI FloatToInt
 
 ## Fork Additions
 This fork includes the following improvements from community pull requests:
 
 * **ComfyUI Folder Paths** by [vitosans](https://github.com/Fannovel16/ComfyUI-Frame-Interpolation/pull/97) - Adds support for ComfyUI's standard `models/checkpoints` directory structure
 * **RIFE Speed Up** by [JohnAlcatraz](https://github.com/Fannovel16/ComfyUI-Frame-Interpolation/pull/102) - Speeds up RIFE by 45x (36.4 seconds -> 0.8 seconds)
-
-**FILM VFI Improvements:**
-* Performance optimizations for faster processing
-* Support for FP16 model: [`film_net_fp16.pt`](https://huggingface.co/jkawamoto/frame-interpolation-pytorch/blob/main/film_net_fp16.pt)
-
-**Other Changes:**
-* Removed all other interpolation methods - this fork contains only FILM and RIFE models for a streamlined experience
-* Bug fixes
-
-## Nodes
-* RIFE VFI (4.0 - 4.9)
-* FILM VFI
-* Make Interpolation State List
-* VFI FloatToInt
 
 ## Install
 ### ComfyUI Manager
@@ -45,13 +51,15 @@ Models can be placed in either of the following locations:
    - `models/checkpoints/vfi_models/film/` for FILM models
 
 2. **Legacy location** (fallback):
-   - `ComfyUI-Frame-Interpolation/ckpts/rife/` for RIFE models
-   - `ComfyUI-Frame-Interpolation/ckpts/film/` for FILM models
+   - `ComfyUI-RIFE-FILM-Only/ckpts/rife/` for RIFE models
+   - `ComfyUI-RIFE-FILM-Only/ckpts/film/` for FILM models
 
 The extension will automatically check the ComfyUI models directory first, and fall back to the legacy location if the models are not found there.
 
+Note: rife40-45 and rife48 return 404 from all download endpoints and no public mirror exists.
+
 ## Usage
-All VFI nodes can be accessed in **category** `ComfyUI-Frame-Interpolation/VFI` if the installation is successful and require a `IMAGE` containing frames (at least 2).
+All VFI nodes can be accessed in **category** `ComfyUI-RIFE-FILM-Only/VFI` if the installation is successful and require a `IMAGE` containing frames (at least 2).
 
 `clear_cache_after_n_frames` is used to avoid out-of-memory. Decreasing it makes the chance lower but also increases processing time.
 

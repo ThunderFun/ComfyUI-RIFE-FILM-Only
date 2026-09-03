@@ -12,6 +12,7 @@ from comfy.model_management import soft_empty_cache, get_torch_device
 import comfy.utils
 import sys
 import time
+from fractions import Fraction
 
 import numpy as np
 
@@ -57,11 +58,24 @@ BASE_MODEL_DOWNLOAD_URLS = [
     "https://github.com/dajes/frame-interpolation-pytorch/releases/download/v1.0.0/"
 ]
 
+# Mirrors for checkpoints missing (404) from all GitHub release endpoints,
+# tried before the base URLs. A plain string keeps the URL's file name; a dict
+# {"url": ..., "file_name": ...} renames the download (Practical-RIFE ships
+# v4.25 as "flownet.pkl"; the bytes are already a state_dict).
+CKPT_URL_OVERRIDES = {
+    "rife46.pth": "https://huggingface.co/windecay/SimpleSDXL2/resolve/main/SimpleModels/controlnet/rife/rife46.pth",
+    "rife425.pth": {
+        "url": "https://huggingface.co/Upsampler/rife-4-25/resolve/main/flownet.pkl",
+        "file_name": "rife425.pth",
+    },
+    "sudo_rife4_269.662_testV1_scale1.pth": "https://huggingface.co/licyk/sd-upscaler-models/resolve/main/ESRGAN/sudo_rife4_269.662_testV1_scale1.pth",
+}
+
 config_path = os.path.join(os.path.dirname(__file__), "./config.yaml")
 if os.path.exists(config_path):
     config = yaml.load(open(config_path, "r"), Loader=yaml.FullLoader)
 else:
-    raise Exception("config.yaml not found. Download it from https://github.com/Fannovel16/ComfyUI-Frame-Interpolation")
+    raise Exception("config.yaml not found. Download it from https://github.com/ThunderFun/ComfyUI-RIFE-FILM-Only")
 DEVICE = get_torch_device()
 
 class InterpolationStateList():
@@ -87,7 +101,7 @@ class MakeInterpolationStateList:
     
     RETURN_TYPES = ("INTERPOLATION_STATES",)
     FUNCTION = "create_options"
-    CATEGORY = "ComfyUI-Frame-Interpolation/VFI"    
+    CATEGORY = "ComfyUI-RIFE-FILM-Only/VFI"
 
     def create_options(self, frame_indices: str, is_skip_list: bool):
         raw_split = frame_indices.split(',')
@@ -114,7 +128,7 @@ def get_ckpt_container_path(model_type):
                 os.makedirs(comfy_vfi_path, exist_ok=True)
                 return os.path.abspath(comfy_vfi_path)
         except Exception as e:
-            print(f"ComfyUI-Frame-Interpolation: Failed to use ComfyUI folder paths ({e}), falling back to local directory")
+            print(f"ComfyUI-RIFE-FILM-Only: Failed to use ComfyUI folder paths ({e}), falling back to local directory")
     
 
     # Fallback to original behavior
@@ -140,9 +154,8 @@ def load_file_from_url(url, model_dir=None, progress=True, file_name=None):
     os.makedirs(model_dir, exist_ok=True)
 
     parts = urlparse(url)
-    file_name = os.path.basename(parts.path)
-    if file_name is not None:
-        file_name = file_name
+    if file_name is None:
+        file_name = os.path.basename(parts.path)
     cached_file = os.path.abspath(os.path.join(model_dir, file_name))
     if not os.path.exists(cached_file):
         print(f'Downloading: "{url}" to {cached_file}\n')
@@ -151,17 +164,29 @@ def load_file_from_url(url, model_dir=None, progress=True, file_name=None):
 
 def load_file_from_github_release(model_type, ckpt_name):
     error_strs = []
-    for i, base_model_download_url in enumerate(BASE_MODEL_DOWNLOAD_URLS):
+    urls = []  # (url, file_name) pairs
+    if ckpt_name in CKPT_URL_OVERRIDES:
+        override = CKPT_URL_OVERRIDES[ckpt_name]
+        if isinstance(override, dict):
+            urls.append((override["url"], override.get("file_name")))
+        else:
+            urls.append((override, None))
+    urls.extend(
+        (base_model_download_url + ckpt_name, None)
+        for base_model_download_url in BASE_MODEL_DOWNLOAD_URLS
+    )
+
+    for i, (url, file_name) in enumerate(urls):
         try:
-            return load_file_from_url(base_model_download_url + ckpt_name, get_ckpt_container_path(model_type))
+            return load_file_from_url(url, get_ckpt_container_path(model_type), file_name=file_name)
         except Exception:
             traceback_str = traceback.format_exc()
-            if i < len(BASE_MODEL_DOWNLOAD_URLS) - 1:
+            if i < len(urls) - 1:
                 print("Failed! Trying another endpoint.")
-            error_strs.append(f"Error when downloading from: {base_model_download_url + ckpt_name}\n\n{traceback_str}")
+            error_strs.append(f"Error when downloading from: {url}\n\n{traceback_str}")
 
     error_str = '\n\n'.join(error_strs)
-    raise Exception(f"Tried all GitHub base URLs to download {ckpt_name} but none succeeded. Error log:\n\n{error_str}")
+    raise Exception(f"Tried all download URLs for {ckpt_name} but none succeeded. Error log:\n\n{error_str}")
                 
 
 def load_file_from_direct_url(model_type, url):
@@ -176,6 +201,152 @@ def postprocess_frames(frames):
 def assert_batch_size(frames, batch_size=2, vfi_name=None):
     subject_verb = "Most VFI models require" if vfi_name is None else f"VFI model {vfi_name} requires"
     assert len(frames) >= batch_size, f"{subject_verb} at least {batch_size} frames to work with, only found {frames.shape[0]}. Please check the frame input using PreviewImage."
+
+
+_FPS_LIMIT_DENOMINATOR = 1_000_000
+
+
+def _parse_fps(value, name):
+    """Parse a user fps into an exact rational.
+
+    Fraction(str(x)) captures the decimal the user typed (or the full float
+    repr) exactly; limit_denominator then snaps NTSC-style rates to their
+    true low-denominator forms (23.976023976023978 -> 24001/1001, 29.97 ->
+    2997/100) so ratios like 23.976 -> 47.952 come out as *exact* integers
+    instead of accumulating float drift that would turn original-frame
+    copies into spurious model calls.
+    """
+    try:
+        frac = Fraction(str(float(value))).limit_denominator(_FPS_LIMIT_DENOMINATOR)
+    except (ValueError, OverflowError):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    if frac <= 0:
+        raise ValueError(f"{name} must be > 0, got {value!r}")
+    return frac
+
+
+def resolve_fps_mode(vfi_name, source_fps, target_fps, video_info=None):
+    """Merge an optional VHS video_info dict into source_fps and validate the pair.
+
+    VHS loaders report the rate of the frames they actually delivered as
+    'loaded_fps', after force_rate and select_every_nth. That rate is what
+    the IMAGE batch contains, so it is used as source_fps. Setting source_fps
+    manually while video_info is connected is ambiguous and raises.
+
+    Returns (source_fps, fps_mode); fps_mode is True only for a complete,
+    positive (source_fps, target_fps) pair.
+    """
+    if video_info is not None:
+        if source_fps > 0:
+            raise ValueError(
+                f"{vfi_name}: source_fps is set manually and video_info is connected; "
+                "reset source_fps to 0 to use the fps detected from video_info.")
+        source_fps = float(video_info.get("loaded_fps", 0))
+        if source_fps <= 0:
+            raise ValueError(f"{vfi_name}: connected video_info has no usable 'loaded_fps'.")
+    fps_mode = (source_fps > 0) or (target_fps > 0)
+    if fps_mode and not (source_fps > 0 and target_fps > 0):
+        if video_info is not None:
+            raise ValueError(
+                f"{vfi_name}: video_info is connected but target_fps is not set. "
+                "Set target_fps to use the detected fps, or disconnect video_info and leave "
+                "both fps inputs at 0 to use the 'multiplier' input instead.")
+        raise ValueError(
+            f"{vfi_name}: source_fps and target_fps must be provided together "
+            "(leave both at 0 to use the 'multiplier' input instead).")
+    return source_fps, fps_mode
+
+
+def compute_fps_schedule(
+    num_frames: int,
+    source_fps: float,
+    target_fps: float,
+    skip_pairs: typing.Optional[typing.Set[int]] = None,
+):
+    """Build the exact output schedule for a source_fps -> target_fps conversion.
+
+    Output frames are sampled on the target-fps tick grid: output tick ``k``
+    corresponds to source-timeline position ``s_k = k * source_fps / target_fps``
+    (in units of source frame intervals). When ``s_k`` lands exactly on a
+    source frame that frame is copied verbatim (no model call); otherwise the
+    frame is synthesized between the two bracketing source frames at
+    ``dt = s_k - floor(s_k)``.
+
+    All position math is done with :class:`fractions.Fraction`, so "is this
+    tick an original frame?" is an exact integer test: no float drift, and
+    equal in/out rates always produce a pure passthrough.
+
+    Args:
+        num_frames: number of input frames (>= 2).
+        source_fps: fps of the input frames (> 0).
+        target_fps: desired output fps (> 0). May be smaller than source_fps
+            (retimed decimation); the same formula handles it.
+        skip_pairs: pair indices that must not be model-interpolated (from an
+            InterpolationStateList). Ticks inside a skipped pair become
+            hold-frames (a copy of the pair's left source frame) so the total
+            output count, and therefore the timing, is unchanged.
+
+    Returns:
+        (total_output, tasks, fills) where
+        total_output: number of output frames.
+        tasks: list of ``(pair_idx, first_out_idx, dts)`` with ``dts`` the
+            ascending list of timesteps to synthesize for that pair, in pair
+            order. Ticks of a pair are consecutive output indices, so the
+            j-th dt of a task writes to ``first_out_idx + j``.
+        fills: list of ``(out_idx, src_frame_idx)`` direct copies (original
+            frames that land on ticks, plus hold-frames for skipped pairs),
+            sorted by out_idx.
+
+    The final input frame is always present in the output: either it lands
+    exactly on the last tick, or one extra output slot is appended holding it.
+    """
+    if num_frames < 2:
+        raise ValueError(f"fps conversion needs at least 2 input frames, got {num_frames}")
+    fs = _parse_fps(source_fps, "source_fps")
+    ft = _parse_fps(target_fps, "target_fps")
+
+    if skip_pairs is None:
+        skip_pairs = set()
+    num_pairs = num_frames - 1
+    bad = [p for p in skip_pairs if not 0 <= p < num_pairs]
+    if bad:
+        raise ValueError(f"skip_pairs contains out-of-range pair indices {bad} for {num_frames} frames")
+
+    # Ratio of target ticks per source frame interval, exact.
+    ratio = ft / fs
+    # Source position of the last reachable tick: k <= (N-1) * ratio.
+    span = (num_frames - 1) * ratio
+    last_tick = span.numerator // span.denominator  # exact floor
+
+    pair_dts: typing.Dict[int, typing.List[float]] = {}
+    pair_first_out: typing.Dict[int, int] = {}
+    fills: typing.List[typing.Tuple[int, int]] = []
+
+    for k in range(last_tick + 1):
+        s = k * fs / ft  # exact source position of tick k
+        i = s.numerator // s.denominator  # floor -> left source frame
+        dt = s - i
+        if dt == 0:
+            fills.append((k, i))
+        elif i in skip_pairs:
+            # Hold-frame: repeat the pair's left frame, timing preserved.
+            fills.append((k, i))
+        else:
+            if i not in pair_dts:
+                pair_dts[i] = []
+                pair_first_out[i] = k
+            pair_dts[i].append(dt.numerator / dt.denominator)
+
+    tasks = [(i, pair_first_out[i], pair_dts[i]) for i in sorted(pair_dts.keys())]
+
+    total_output = last_tick + 1
+    if span.denominator != 1:
+        # The last input frame falls between ticks; append it so the output
+        # always ends on the final source frame.
+        fills.append((last_tick + 1, num_frames - 1))
+        total_output += 1
+
+    return total_output, tasks, fills
 
 def _generic_frame_loop(
         frames,
@@ -317,7 +488,7 @@ class FloatToInt:
     
     RETURN_TYPES = ("INT",)
     FUNCTION = "convert"
-    CATEGORY = "ComfyUI-Frame-Interpolation"
+    CATEGORY = "ComfyUI-RIFE-FILM-Only"
 
     def convert(self, float):
         if hasattr(float, "__iter__"):

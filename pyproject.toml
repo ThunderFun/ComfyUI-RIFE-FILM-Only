@@ -1,13 +1,13 @@
 [project]
-name = "comfyui-frame-interpolation"
-description = "A custom node suite for Video Frame Interpolation in ComfyUI"
-version = "1.0.7"
+name = "comfyui-rife-film-only"
+description = "A custom node set for Video Frame Interpolation in ComfyUI, containing only FILM and RIFE models"
+version = "1.0.0"
 license = { file = "LICENSE" }
 
 [project.urls]
-Repository = "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation"
+Repository = "https://github.com/ThunderFun/ComfyUI-RIFE-FILM-Only"
 
 [tool.comfy]
-PublisherId = "fannovel16"
-DisplayName = "ComfyUI-Frame-Interpolation"
+PublisherId = "ThunderFun"
+DisplayName = "ComfyUI-RIFE-FILM-Only"
 Icon = ""

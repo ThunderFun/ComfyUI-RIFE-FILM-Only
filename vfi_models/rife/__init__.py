@@ -5,6 +5,8 @@ from vfi_utils import (
     preprocess_frames,
     InterpolationStateList,
     VFIProgressBar,
+    compute_fps_schedule,
+    resolve_fps_mode,
 )
 import typing
 import operator
@@ -43,6 +45,7 @@ CKPT_NAME_VER_DICT = {
     "rife48.pth": "4.7",
     "rife49.pth": "4.7",
     "rife417.pth": "4.17",
+    "rife425.pth": "4.26",
     "rife426.pth": "4.26",
     "sudo_rife4_269.662_testV1_scale1.pth": "4.0"
     # Arch 4.10 doesn't work due to state dict mismatch
@@ -50,6 +53,8 @@ CKPT_NAME_VER_DICT = {
     # "rife411.pth": "4.10",
     # "rife412.pth": "4.10"
 }
+# rife425.pth: official Practical-RIFE v4.25 weights (released as "flownet.pkl",
+# see CKPT_URL_OVERRIDES in vfi_utils.py); key/shape-identical to the 4.26 IFNet.
 
 # Cached models: ckpt_name -> (model, model_dtype). Mirrors the FILM node's
 # MODEL_CACHE so repeated runs skip the disk read, the weight copy and the
@@ -131,7 +136,13 @@ def _load_model(ckpt_name, model_dtype, device):
     # Some checkpoints bundle training-only modules (a "teacher" network and
     # a "caltime" timestep-calibration MLP). Strip keys that do not map to a
     # model parameter/buffer so strict loading still catches real mismatches.
+    # DataParallel-saved checkpoints (e.g. Practical-RIFE v4.25) prefix every
+    # key with "module.".
     model_keys = set(interpolation_model.state_dict().keys())
+    state_dict = {
+        k[len("module."):] if k.startswith("module.") else k: v
+        for k, v in state_dict.items()
+    }
     state_dict = {k: v for k, v in state_dict.items() if k in model_keys}
     interpolation_model.load_state_dict(state_dict, assign=assign_enabled)
 
@@ -164,7 +175,7 @@ class RIFE_VFI:
             "required": {
                 "ckpt_name": (
                     sorted(list(CKPT_NAME_VER_DICT.keys()), key=lambda ckpt_name: version.parse(CKPT_NAME_VER_DICT[ckpt_name]), reverse=True),
-                    {"default": "rife47.pth", "tooltip":
+                    {"default": "rife426.pth", "tooltip":
                         "RIFE model weights to use. The list is sorted newest-first by architecture version. "
                         "Newer versions (e.g. 4.26, 4.17, 4.7) generally produce higher quality, while older "
                         "ones (4.0-4.3) are the only ones that support the RefineNet step controlled by 'fast_mode'. "
@@ -208,6 +219,24 @@ class RIFE_VFI:
                     "after each run."}),
             },
             "optional": {
+                "source_fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0, "step": 0.001, "tooltip":
+                    "Frame rate of the input frames (e.g. 24, 29.97, 23.976). Set BOTH this and 'target_fps' "
+                    "to enable fps mode, which overrides 'multiplier': output frames are sampled on the exact "
+                    "target-fps timeline, so fractional conversions like 24 -> 60 (2.5x) are retimed correctly "
+                    "instead of rounded to a whole multiplier. RIFE's temporal encoding synthesizes frames at "
+                    "arbitrary timesteps, so fractional ratios stay high quality. Leave both at 0 to use 'multiplier'."}),
+                "target_fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0, "step": 0.001, "tooltip":
+                    "Desired output frame rate. Fractional ratios (24 -> 60) and slowdowns (target < source, "
+                    "retimed decimation) are supported. Original frames that land on the target grid are copied "
+                    "verbatim; pairs excluded via Interpolation States become hold-frames so the output timing "
+                    "stays exact. Feed the result to a video saver with frame_rate = target_fps. "
+                    "Leave both fps inputs at 0 to use 'multiplier'."}),
+                "video_info": ("VHS_VIDEOINFO", {"tooltip":
+                    "Connect the 'video_info' output of a Video Helper Suite Load Video node to "
+                    "auto-detect source_fps. Takes the loader's 'loaded_fps', the rate of the "
+                    "frames actually loaded after force_rate and select_every_nth, so subsampled "
+                    "loads stay timed correctly. Requires target_fps to be set and cannot be "
+                    "combined with a manual source_fps."}),
                 "optional_interpolation_states": ("INTERPOLATION_STATES", {"tooltip":
                     "Optional. Connect a 'Make Interpolation State List' node to selectively skip or include specific frame "
                     "pairs for interpolation. If left unconnected, every consecutive pair of frames is interpolated."})
@@ -216,7 +245,7 @@ class RIFE_VFI:
 
     RETURN_TYPES = ("IMAGE", )
     FUNCTION = "vfi"
-    CATEGORY = "ComfyUI-Frame-Interpolation/VFI"
+    CATEGORY = "ComfyUI-RIFE-FILM-Only/VFI"
 
     def vfi(
         self,
@@ -229,9 +258,13 @@ class RIFE_VFI:
         scale_factor: float = 1.0,
         precision: str = "fp32",
         keep_model_loaded: bool = True,
+        source_fps: float = 0.0,
+        target_fps: float = 0.0,
+        video_info: typing.Optional[dict] = None,
         optional_interpolation_states: InterpolationStateList = None,
         **kwargs
     ):
+        source_fps, fps_mode = resolve_fps_mode("RIFE VFI", source_fps, target_fps, video_info)
         device = get_torch_device()
         arch_ver = CKPT_NAME_VER_DICT[ckpt_name]
         if arch_ver == "4.26":
@@ -263,13 +296,48 @@ class RIFE_VFI:
         if num_pairs < 1:
             raise ValueError("RIFE VFI requires at least 2 input frames.")
 
-        # multiplier may arrive as int, numpy integer, or a list of per-pair ints.
-        try:
-            m_scalar = operator.index(multiplier)
-            multipliers = [m_scalar] * num_pairs
-        except TypeError:
-            multipliers = list(map(int, multiplier))
-            multipliers += [2] * (num_pairs - len(multipliers))
+        # fps mode: sample the output on the exact target-fps tick grid.
+        if fps_mode:
+            skip_pairs = set()
+            if optional_interpolation_states is not None:
+                skip_pairs = {
+                    i for i in range(num_pairs)
+                    if optional_interpolation_states.is_frame_skipped(i)
+                }
+            total_output, fps_layout, fills = compute_fps_schedule(
+                num_pairs + 1, source_fps, target_fps, skip_pairs)
+            pair_tasks = [(p, dts) for p, _out0, dts in fps_layout]
+            mid_offsets = {p: out0 for p, out0, _dts in fps_layout}
+            num_mids = {p: len(dts) for p, _out0, dts in fps_layout}
+            print(f"RIFE VFI: fps mode {source_fps} -> {target_fps} fps "
+                  f"(x{target_fps / source_fps:.6g}): {num_pairs + 1} -> {total_output} frames")
+        else:
+            # multiplier may arrive as int, numpy integer, or a list of per-pair ints.
+            try:
+                m_scalar = operator.index(multiplier)
+                multipliers = [m_scalar] * num_pairs
+            except TypeError:
+                multipliers = list(map(int, multiplier))
+                multipliers += [2] * (num_pairs - len(multipliers))
+
+            # Task layout: for each non-skipped pair with multiplier > 1, reserve a
+            # run of output slots for its interpolated frames.
+            mid_offsets = {}
+            num_mids = {}
+            pair_tasks = []  # (pair_idx, [dt, ...])
+            total_output = 0
+            for pair_idx in range(num_pairs):
+                total_output += 1  # leading original frame
+                m = multipliers[pair_idx]
+                if (optional_interpolation_states is not None
+                        and optional_interpolation_states.is_frame_skipped(pair_idx)) or m <= 1:
+                    continue
+                dts = [step / m for step in range(1, m)]
+                mid_offsets[pair_idx] = total_output
+                num_mids[pair_idx] = len(dts)
+                total_output += len(dts)
+                pair_tasks.append((pair_idx, dts))
+            total_output += 1  # trailing original frame
 
         # Scale list for multi-scale processing (4.26 uses 5 stages instead of 4)
         if arch_ver == "4.26":
@@ -280,38 +348,26 @@ class RIFE_VFI:
         h, w = frames_nchw.shape[2], frames_nchw.shape[3]
         c = frames_nchw.shape[1]
 
-        # Task layout: for each non-skipped pair with multiplier > 1, reserve a
-        # run of output slots for its interpolated frames.
-        mid_offsets = {}
-        num_mids = {}
-        pair_tasks = []  # (pair_idx, [dt, ...])
-        total_output = 0
-        for pair_idx in range(num_pairs):
-            total_output += 1  # leading original frame
-            m = multipliers[pair_idx]
-            if (optional_interpolation_states is not None
-                    and optional_interpolation_states.is_frame_skipped(pair_idx)) or m <= 1:
-                continue
-            dts = [step / m for step in range(1, m)]
-            mid_offsets[pair_idx] = total_output
-            num_mids[pair_idx] = len(dts)
-            total_output += len(dts)
-            pair_tasks.append((pair_idx, dts))
-        total_output += 1  # trailing original frame
-
         # Output buffer is allocated directly in NHWC fp32 (ComfyUI IMAGE
         # layout), so the final rearrange in postprocess_frames (a second
         # full-size tensor) never happens. Every slot is written exactly once.
         output_frames = torch.empty(total_output, h, w, c, dtype=torch.float32, device="cpu")
 
-        # Place every original frame in its final position up front.
         frames_nhwc3 = frames[..., :3]
-        fill_pos = 0
-        for pair_idx in range(num_pairs):
-            output_frames[fill_pos] = frames_nhwc3[pair_idx]
-            fill_pos += 1
-            fill_pos += num_mids.get(pair_idx, 0)
-        output_frames[fill_pos] = frames_nhwc3[-1]
+        if fps_mode:
+            # Tick-grid layout: originals that land on ticks (plus hold-frames
+            # for skipped pairs and the appended final frame) go to their
+            # exact output slots; model tasks fill the rest below.
+            for out_idx, src_idx in fills:
+                output_frames[out_idx] = frames_nhwc3[src_idx]
+        else:
+            # Place every original frame in its final position up front.
+            fill_pos = 0
+            for pair_idx in range(num_pairs):
+                output_frames[fill_pos] = frames_nhwc3[pair_idx]
+                fill_pos += 1
+                fill_pos += num_mids.get(pair_idx, 0)
+            output_frames[fill_pos] = frames_nhwc3[-1]
 
         total_tasks = sum(len(dts) for _, dts in pair_tasks)
         pbar = VFIProgressBar(total_tasks, desc="RIFE VFI")

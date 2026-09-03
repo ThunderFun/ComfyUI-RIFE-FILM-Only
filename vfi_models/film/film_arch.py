@@ -386,6 +386,7 @@ class Interpolator(nn.Module):
             flow_convs=(3, 3, 3, 3),
             flow_filters=(32, 64, 128, 256),
             compile: bool = True,
+            fixed_midpoint: bool = True,
     ):
         super().__init__()
         self.pyramid_levels = pyramid_levels
@@ -394,6 +395,11 @@ class Interpolator(nn.Module):
         self.extract = FeatureExtractor(3, filters, sub_levels)
         self.predict_flow = PyramidFlowEstimator(filters, flow_convs, flow_filters)
         self.fuse = Fusion(sub_levels, specialized_levels, filters)
+
+        # See debug_forward: fixed_midpoint=True ignores the requested
+        # timestep (the released checkpoints' training regime) and always
+        # synthesizes the midpoint; False scales the flows by dt.
+        self.fixed_midpoint = fixed_midpoint
         
         # Applying channels_last memory format to model weights for FP16 speedup
         if torch.cuda.is_available():
@@ -463,8 +469,15 @@ class Interpolator(nn.Module):
         forward_flow_pyramid = flow_pyramid_synthesis(forward_residual_flow_pyramid)[:self.fusion_pyramid_levels]
         backward_flow_pyramid = flow_pyramid_synthesis(backward_residual_flow_pyramid)[:self.fusion_pyramid_levels]
 
-        # Desired fractional time (fixed to 0.5 in FILM)
-        mid_time = torch.full_like(batch_dt, .5)
+        # Desired fractional time. With fixed_midpoint=True the requested
+        # time is replaced by 0.5 (the released checkpoints' training
+        # regime), so multi-frame interpolation needs recursion. With
+        # fixed_midpoint=False the flow pyramids are scaled by the requested
+        # time; this is the dt wiring the FILM VFI fps mode uses.
+        if self.fixed_midpoint:
+            mid_time = torch.full_like(batch_dt, .5)
+        else:
+            mid_time = batch_dt
         backward_flow = multiply_pyramid(backward_flow_pyramid, mid_time[:, 0])
         forward_flow = multiply_pyramid(forward_flow_pyramid, 1 - mid_time[:, 0])
 
