@@ -10,6 +10,7 @@ from vfi_utils import (
     postprocess_frames,
     compute_fps_schedule,
     resolve_fps_mode,
+    multiplier_output_fps,
 )
 import pathlib
 import gc
@@ -286,20 +287,28 @@ class FILM_VFI:
                     "Desired output frame rate. Fractional ratios (24 -> 60) and slowdowns (target < source) are "
                     "supported. Original frames that land on the target grid are copied verbatim; pairs excluded via "
                     "Interpolation States become hold-frames so the output timing stays exact. Feed the result to a "
-                    "video saver with frame_rate = target_fps. Leave both fps inputs at 0 to use 'multiplier'."}),
+                    "video saver with frame_rate = target_fps, or connect the node's frame_rate output. "
+                    "Leave both fps inputs at 0 to use 'multiplier'."}),
                 "video_info": ("VHS_VIDEOINFO", {"tooltip":
                     "Connect the 'video_info' output of a Video Helper Suite Load Video node to "
                     "auto-detect source_fps. Takes the loader's 'loaded_fps', the rate of the "
                     "frames actually loaded after force_rate and select_every_nth, so subsampled "
-                    "loads stay timed correctly. Requires target_fps to be set and cannot be "
-                    "combined with a manual source_fps."}),
+                    "loads stay timed correctly. With target_fps set, this enables fps mode; "
+                    "otherwise 'multiplier' runs and the frame_rate output reports the detected "
+                    "rate times the multiplier. Cannot be combined with a manual source_fps."}),
                 "optional_interpolation_states": ("INTERPOLATION_STATES", {"tooltip":
                     "Optional. Connect a 'Make Interpolation State List' node to selectively skip or include specific frame "
                     "pairs for interpolation. If left unconnected, every consecutive pair of frames is interpolated."})
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = ("IMAGE", "FLOAT")
+    RETURN_NAMES = ("IMAGE", "frame_rate")
+    OUTPUT_TOOLTIPS = ("The interpolated frames.",
+                       "Frame rate of the returned frames. target_fps in fps mode, otherwise "
+                       "the source rate times the multiplier. 0.0 when the input rate is "
+                       "unknown (no fps inputs and no video_info), or when skipped pairs or "
+                       "uneven per-pair multipliers make the timing non-uniform.")
     FUNCTION = "vfi"
     CATEGORY = "ComfyUI-RIFE-FILM-Only/VFI"
 
@@ -356,6 +365,9 @@ class FILM_VFI:
         else:
             multipliers = list(map(int, multiplier))
             multipliers += [2] * (num_input_frames - len(multipliers) - 1)
+        any_skipped = interpolation_states is not None and any(
+            interpolation_states.is_frame_skipped(i) for i in range(num_input_frames - 1))
+        output_fps = multiplier_output_fps(source_fps, multipliers, any_skipped)
 
         total_output_frames = sum(multipliers) + 1
         output_frames = torch.zeros(
@@ -404,7 +416,7 @@ class FILM_VFI:
         soft_empty_cache()
         gc.collect()
 
-        return (postprocess_frames(output_frames[:out_len]),)
+        return (postprocess_frames(output_frames[:out_len]), output_fps)
 
     def _vfi_fps(
         self,
@@ -481,7 +493,7 @@ class FILM_VFI:
         soft_empty_cache()
         gc.collect()
 
-        return (postprocess_frames(output_frames),)
+        return (postprocess_frames(output_frames), target_fps)
 
 
 NODE_CLASS_MAPPINGS = {
