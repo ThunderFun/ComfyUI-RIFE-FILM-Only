@@ -60,6 +60,20 @@ MODEL_CACHE = {}
 # as a value so the id cannot be recycled while the verdict is alive.
 _DT_RESPONSE_CACHE = {}
 
+# Pinned host staging buffers for fps-mode result downloads, keyed by
+# (C, H, W, dtype). Reused across pairs to avoid repeated cudaHostAlloc cost.
+_STAGING_CACHE = {}
+_STAGING_MAX_SLOTS = 8
+
+
+def _staging_buffer(channels, height, width, dtype, slots):
+    key = (channels, height, width, dtype)
+    buf = _STAGING_CACHE.get(key)
+    if buf is None or buf.shape[0] < slots:
+        buf = torch.empty(slots, channels, height, width, dtype=dtype, pin_memory=True)
+        _STAGING_CACHE[key] = buf
+    return buf
+
 
 def clear_model_cache():
     global MODEL_CACHE
@@ -67,7 +81,9 @@ def clear_model_cache():
         model, _ = MODEL_CACHE[ckpt_name]
         del model
         del MODEL_CACHE[ckpt_name]
-    MODEL_CACHE = {}
+    # Clear in place: other modules hold references to this dict object
+    # (e.g. tests seeding stub models), so rebinding would orphan them.
+    MODEL_CACHE.clear()
     _DT_RESPONSE_CACHE.clear()
     soft_empty_cache()
     gc.collect()
@@ -387,8 +403,10 @@ class FILM_VFI:
 
             n_inter = multipliers[frame_itr] - 1
 
-            frame_0 = frames_nchw[frame_itr : frame_itr + 1].to(device, non_blocking=True).to(model_dtype)
-            frame_1 = frames_nchw[frame_itr + 1 : frame_itr + 2].to(device, non_blocking=True).to(model_dtype)
+            # Cast to model dtype on the host first: halves the upload and
+            # drops a GPU cast kernel. Host and device round identically.
+            frame_0 = frames_nchw[frame_itr : frame_itr + 1].to(model_dtype).to(device, non_blocking=True)
+            frame_1 = frames_nchw[frame_itr + 1 : frame_itr + 2].to(model_dtype).to(device, non_blocking=True)
 
             schedule = build_bisection_schedule(n_inter)
             results = inference(
@@ -460,6 +478,10 @@ class FILM_VFI:
         if needs_arbitrary_t and not _model_responds_to_dt(model, device, model_dtype):
             model, model_dtype = _load_timeaware_model(ckpt_name, device)
 
+        # State reuse needs the rehosted Interpolator interface; anything
+        # else (e.g. test stubs taking (x0, x1, dt)) uses the per-dt loop.
+        reuse_pair_state = needs_arbitrary_t and hasattr(model, "dt_invariant_state")
+
         output_frames = torch.zeros(
             total_output, *frames_nchw.shape[1:], dtype=output_dtype, device="cpu"
         )
@@ -473,15 +495,59 @@ class FILM_VFI:
         pbar = VFIProgressBar(total_tasks, desc="FILM VFI")
         frames_processed = 0
 
+        # Enqueue every timestep's synthesis and download, then sync once
+        # per pair instead of per frame.
+        max_dts = max((len(dts) for _, _out0, dts in tasks), default=0)
+        use_staging = (
+            device.type == "cuda"
+            and reuse_pair_state
+            and 2 <= max_dts <= _STAGING_MAX_SLOTS
+        )
+        if use_staging:
+            _c, _h, _w = frames_nchw.shape[1:]
+            staging = _staging_buffer(_c, _h, _w, output_dtype, max_dts)
+        else:
+            staging = None
+
         for pair_idx, out_start, dts in tasks:
-            frame_0 = frames_nchw[pair_idx: pair_idx + 1].to(device, non_blocking=True).to(model_dtype)
-            frame_1 = frames_nchw[pair_idx + 1: pair_idx + 2].to(device, non_blocking=True).to(model_dtype)
+            # Cast on the host first, as in the multiplier loop: halves the
+            # upload, drops a GPU cast kernel.
+            frame_0 = frames_nchw[pair_idx: pair_idx + 1].to(model_dtype).to(device, non_blocking=True)
+            frame_1 = frames_nchw[pair_idx + 1: pair_idx + 2].to(model_dtype).to(device, non_blocking=True)
 
-            mids = inference_exact(model, frame_0, frame_1, dts, model_dtype, device)
+            if reuse_pair_state:
+                # Feature extraction and flow estimation are dt-invariant:
+                # compute them once per pair, then evaluate every requested
+                # timestep from the shared state. Mirrors
+                # Interpolator.forward (channels-last + autocast) so the
+                # results match per-dt model calls exactly.
+                if device.type == "cuda":
+                    frame_0 = frame_0.to(memory_format=torch.channels_last)
+                    frame_1 = frame_1.to(memory_format=torch.channels_last)
+                with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                    pair_state, _ = model.dt_invariant_state(frame_0, frame_1)
+                    for j, dt in enumerate(dts):
+                        dt_tensor = torch.tensor([[dt]], device=device, dtype=model_dtype)
+                        mid = model.synthesize_from_state(pair_state, dt_tensor).clamp(0, 1)
+                        if staging is not None and len(dts) > 1:
+                            staging[j].copy_(mid.detach().reshape(staging.shape[1:]), non_blocking=True)
+                        else:
+                            output_frames[out_start + j] = mid.detach().to(dtype=output_dtype)
+                    if staging is not None and len(dts) > 1:
+                        torch.cuda.current_stream(device).synchronize()
+                        for j in range(len(dts)):
+                            output_frames[out_start + j] = staging[j]
+                del pair_state
+            else:
+                # Shipped model (all dt == 0.5): one model call per frame,
+                # identical to the multiplier path, keeping fps and
+                # multiplier outputs bit-exact.
+                mids = inference_exact(model, frame_0, frame_1, dts, model_dtype, device)
+                for j, mid in enumerate(mids):
+                    output_frames[out_start + j] = mid.detach().to(dtype=output_dtype)
+                del mids
 
-            for j, mid in enumerate(mids):
-                output_frames[out_start + j] = mid.detach().to(dtype=output_dtype)
-            del mids, frame_0, frame_1
+            del frame_0, frame_1
 
             frames_processed += 1
             if frames_processed >= clear_cache_after_n_frames:

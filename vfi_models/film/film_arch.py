@@ -431,20 +431,26 @@ class Interpolator(nn.Module):
         
         return [x0_pyramid, x1_pyramid]
 
-    def debug_forward(self, x0, x1, batch_dt) -> Dict[str, List[torch.Tensor]]:
+    def dt_invariant_state(self, x0, x1):
+        """Compute everything about a frame pair that does not depend on dt.
+
+        The shared prefix of debug_forward: image/feature pyramids and the
+        unscaled forward/backward flow pyramids. fps mode evaluates several
+        timesteps per pair and reuses this state instead of recomputing it.
+
+        Returns (pair_state, debug_flows); pair_state feeds
+        synthesize_from_state, debug_flows carries the residual pyramids
+        for debug_forward's introspection dict.
+        """
         # We find the first parameter to determine the target device and dtype
         p = next(self.parameters())
-        if batch_dt.dtype != p.dtype: batch_dt = batch_dt.to(dtype=p.dtype)
-        if batch_dt.device != p.device: batch_dt = batch_dt.to(device=p.device)
-        
+        x_batched = torch.cat([x0, x1], dim=0).to(device=p.device, dtype=p.dtype)
         batch_size = x0.shape[0]
 
-        # Batch image pyramids and feature extraction
-        x_batched = torch.cat([x0, x1], dim=0).to(device=p.device, dtype=p.dtype)
         image_pyramid_batched = build_image_pyramid(x_batched, self.pyramid_levels)
         feature_pyramid_batched = self.extract(image_pyramid_batched)
-        
-        # Split feature pyramids
+
+        # Split feature and image pyramids
         feature_pyramids = [
             [f[:batch_size] for f in feature_pyramid_batched],
             [f[batch_size:] for f in feature_pyramid_batched]
@@ -458,9 +464,9 @@ class Interpolator(nn.Module):
         # feat_a: [f0, f1], feat_b: [f1, f0]
         feat_a_batched = [torch.cat([f[:batch_size], f[batch_size:]], dim=0) for f in feature_pyramid_batched]
         feat_b_batched = [torch.cat([f[batch_size:], f[:batch_size]], dim=0) for f in feature_pyramid_batched]
-        
+
         residual_flow_pyramid_batched = self.predict_flow(feat_a_batched, feat_b_batched)
-        
+
         # Split residual flows
         forward_residual_flow_pyramid = [r[:batch_size] for r in residual_flow_pyramid_batched]
         backward_residual_flow_pyramid = [r[batch_size:] for r in residual_flow_pyramid_batched]
@@ -468,6 +474,33 @@ class Interpolator(nn.Module):
         # Convert to full flows
         forward_flow_pyramid = flow_pyramid_synthesis(forward_residual_flow_pyramid)[:self.fusion_pyramid_levels]
         backward_flow_pyramid = flow_pyramid_synthesis(backward_residual_flow_pyramid)[:self.fusion_pyramid_levels]
+
+        # Warp sources are dt-invariant too: concat(img, feat) per level.
+        # Built once here, saving two pyramid concatenations per dt; the
+        # inputs never change in between, so results stay bitwise identical.
+        pyramids0_to_warp = concatenate_pyramids(image_pyramids[0][:self.fusion_pyramid_levels],
+                                               feature_pyramids[0][:self.fusion_pyramid_levels])
+        pyramids1_to_warp = concatenate_pyramids(image_pyramids[1][:self.fusion_pyramid_levels],
+                                               feature_pyramids[1][:self.fusion_pyramid_levels])
+
+        pair_state = (pyramids0_to_warp, pyramids1_to_warp,
+                      forward_flow_pyramid, backward_flow_pyramid)
+        debug_flows = (forward_residual_flow_pyramid, backward_residual_flow_pyramid)
+        return pair_state, debug_flows
+
+    def synthesize_from_state(self, pair_state, batch_dt) -> torch.Tensor:
+        """Synthesize the frame at batch_dt from a precomputed pair state.
+
+        Applies the dt-dependent suffix of debug_forward: flow scaling by
+        the requested timestep, warping and fusion. Ops and ordering match
+        debug_forward, so results are bitwise identical.
+        """
+        (pyramids0_to_warp, pyramids1_to_warp,
+         forward_flow_pyramid, backward_flow_pyramid) = pair_state
+
+        p = next(self.parameters())
+        if batch_dt.dtype != p.dtype: batch_dt = batch_dt.to(dtype=p.dtype)
+        if batch_dt.device != p.device: batch_dt = batch_dt.to(device=p.device)
 
         # Desired fractional time. With fixed_midpoint=True the requested
         # time is replaced by 0.5 (the released checkpoints' training
@@ -481,28 +514,32 @@ class Interpolator(nn.Module):
         backward_flow = multiply_pyramid(backward_flow_pyramid, mid_time[:, 0])
         forward_flow = multiply_pyramid(forward_flow_pyramid, 1 - mid_time[:, 0])
 
-        # Fused construction of the aligned pyramid for fusion stage
-        # Each level is concat(img0_warped, feat0_warped, img1_warped, feat1_warped, flow_back, flow_fwd)
-        
         # Warp image 0 with backward flow and image 1 with forward flow
-        pyramids0_to_warp = concatenate_pyramids(image_pyramids[0][:self.fusion_pyramid_levels],
-                                               feature_pyramids[0][:self.fusion_pyramid_levels])
-        pyramids1_to_warp = concatenate_pyramids(image_pyramids[1][:self.fusion_pyramid_levels],
-                                               feature_pyramids[1][:self.fusion_pyramid_levels])
-        
         forward_warped_pyramid = pyramid_warp(pyramids0_to_warp, backward_flow)
         backward_warped_pyramid = pyramid_warp(pyramids1_to_warp, forward_flow)
 
         # Final fused pyramid concatenation
-        aligned_pyramid = fuse_pyramids(forward_warped_pyramid, backward_warped_pyramid, 
+        aligned_pyramid = fuse_pyramids(forward_warped_pyramid, backward_warped_pyramid,
                                       backward_flow, forward_flow)
 
+        return self.fuse(aligned_pyramid)
+
+    def debug_forward(self, x0, x1, batch_dt) -> Dict[str, List[torch.Tensor]]:
+        # We find the first parameter to determine the target device and dtype
+        p = next(self.parameters())
+        if batch_dt.dtype != p.dtype: batch_dt = batch_dt.to(dtype=p.dtype)
+        if batch_dt.device != p.device: batch_dt = batch_dt.to(device=p.device)
+
+        pair_state, debug_flows = self.dt_invariant_state(x0, x1)
+        forward_residual_flow_pyramid, backward_residual_flow_pyramid = debug_flows
+        image = self.synthesize_from_state(pair_state, batch_dt)
+
         return {
-            'image': [self.fuse(aligned_pyramid)],
+            'image': [image],
             'forward_residual_flow_pyramid': forward_residual_flow_pyramid,
             'backward_residual_flow_pyramid': backward_residual_flow_pyramid,
-            'forward_flow_pyramid': forward_flow_pyramid,
-            'backward_flow_pyramid': backward_flow_pyramid,
+            'forward_flow_pyramid': pair_state[2],
+            'backward_flow_pyramid': pair_state[3],
         }
 
 
